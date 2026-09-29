@@ -13,6 +13,7 @@ import statistics
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -164,10 +165,12 @@ def build_command(
     command = [
         pi_binary, "--mode", "json", "--provider", PROVIDER, "--model", MODEL,
         "--thinking", THINKING, "--session-dir", str(session_dir),
-        "--tools", ",".join(CORE_TOOLS), "--no-extensions", "--no-skills",
+        "--tools", ",".join(CORE_TOOLS), "--no-skills",
         "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve",
     ]
-    if arm != "stock":
+    if arm == "stock":
+        command.append("--no-extensions")
+    else:
         entry = Path(extension_paths[arm])
         if not entry.is_absolute():
             raise ValueError(f"extension path must be absolute: {entry}")
@@ -298,6 +301,27 @@ def _pump(stream: Any, path: Path) -> None:
             output.flush()
 
 
+def _terminate_process(process: subprocess.Popen, grace_seconds: float) -> None:
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
 def run_process(
     command: list[str], cwd: Path, env: dict[str, str], event_path: Path, stderr_path: Path,
     deadline_seconds: float, terminate_grace_seconds: float = 3.0,
@@ -313,37 +337,23 @@ def run_process(
     stderr_thread = threading.Thread(target=_pump, args=(process.stderr, stderr_path), daemon=True)
     stdout_thread.start()
     stderr_thread.start()
-    timed_out = False
+    timed_out = interrupted = False
     try:
         process.wait(timeout=deadline_seconds)
     except subprocess.TimeoutExpired:
         timed_out = True
-        try:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGTERM)
-            else:
-                process.terminate()
-        except ProcessLookupError:
-            pass
-        try:
-            process.wait(timeout=terminate_grace_seconds)
-        except subprocess.TimeoutExpired:
-            try:
-                if os.name == "posix":
-                    os.killpg(process.pid, signal.SIGKILL)
-                else:
-                    process.kill()
-            except ProcessLookupError:
-                pass
-            process.wait()
+        _terminate_process(process, terminate_grace_seconds)
+    except KeyboardInterrupt:
+        interrupted = True
+        _terminate_process(process, terminate_grace_seconds)
     stdout_thread.join(timeout=5)
     stderr_thread.join(timeout=5)
     process.stdout.close()
     process.stderr.close()
     return {
-        "exit_code": process.returncode, "timed_out": timed_out,
+        "exit_code": process.returncode, "timed_out": timed_out, "interrupted": interrupted,
         "elapsed_ms": round((time.monotonic() - started) * 1000),
-        "termination_reason": "deadline" if timed_out else "process_exit",
+        "termination_reason": "interrupted" if interrupted else "deadline" if timed_out else "process_exit",
     }
 
 
@@ -463,7 +473,9 @@ def _time_value(record: dict[str, Any], *keys: str) -> int | float | None:
     return None
 
 
-def extract_children(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def extract_children(events: list[dict[str, Any]], arm: str) -> list[dict[str, Any]]:
+    if arm != "subagents":
+        return []
     found: dict[str, dict[str, Any]] = {}
     for event in events:
         for record in _walk(event):
@@ -497,13 +509,16 @@ def overlap_summary(children: list[dict[str, Any]]) -> dict[str, Any]:
         if start is not None and end is not None and end > start:
             intervals.append((start, 1))
             intervals.append((end, -1))
+    if len(intervals) != 2 * len(children):
+        return {"interval_count": len(intervals) // 2 or None, "max_concurrency": None, "evidenced": False}
     active = maximum = 0
     for _, delta in sorted(intervals, key=lambda item: (item[0], item[1])):
         active += delta
         maximum = max(maximum, active)
     return {
-        "interval_count": len(intervals) // 2, "max_concurrency": maximum,
-        "evidenced": maximum >= 2,
+        "interval_count": len(intervals) // 2 or None,
+        "max_concurrency": maximum if children else None,
+        "evidenced": bool(children) and maximum >= 2,
     }
 
 
@@ -536,27 +551,41 @@ def _text_values(value: Any):
             yield from _text_values(child)
 
 
-def child_launch_evidence(arm: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+def child_launch_evidence(
+    arm: str, events: list[dict[str, Any]], case: str, project_dir: Path, deadline_seconds: int,
+) -> dict[str, Any]:
     calls = _tool_calls(events)
+    if arm == "fabric":
+        return {
+            "verified": False, "tool_calls": [name for name, _ in calls],
+            "reason": "runner-generated Fabric child telemetry is unavailable",
+        }
+    expected_cwd = re.escape(json.dumps(str(project_dir)))
+    expected_timeout = deadline_seconds * 1000
+    expected_tasks = _child_tasks(case, project_dir)
     if arm == "subagents":
         scripts = [" ".join(_text_values(args)) for name, args in calls if name == "subagent"]
-        valid = any(
-            "runs.all" in script
-            and len(re.findall(r"extensions[\"\']?\s*:\s*\[\s*\]", script)) >= CHILD_CAP
-            and "skills" in script and "openai/gpt-6-sol:xhigh" in script
-            for script in scripts
-        )
-        return {"verified": valid, "tool_calls": [name for name, _ in calls], "reason": "subagent workflow request with empty child extensions" if valid else "workflow child loadout not observable"}
-    if arm == "fabric":
-        scripts = [" ".join(_text_values(args)) for name, args in calls if name == "fabric_exec"]
-        valid = any(
-            "agents.run" in script and "Promise.all" in script
-            and re.search(r"extensions[\"\']?\s*:\s*false", script)
-            and len(re.findall(r"[\"\']key[\"\']\s*:", script)) >= CHILD_CAP
-            and "openai/gpt-6-sol" in script
-            for script in scripts
-        )
-        return {"verified": valid, "tool_calls": [name for name, _ in calls], "reason": "Fabric leaf request disables extensions" if valid else "Fabric child loadout not observable"}
+        valid = False
+        if len(scripts) == 1:
+            script = scripts[0]
+            model = re.escape(json.dumps(f"{PROVIDER}/{MODEL}:{THINKING}"))
+            child_count = lambda pattern: len(re.findall(pattern, script)) == CHILD_CAP
+            valid = (
+                script.count("runs.all") == 1 and script.count("runs.run") == 0
+                and child_count(r'"key"\s*:')
+                and all(json.dumps(task["key"]) in script and json.dumps(task["task"]) in script
+                        for task in expected_tasks)
+                and child_count(r'"extensions"\s*:\s*\[\s*\]')
+                and child_count(r'"skills"\s*:\s*\[\s*\]')
+                and child_count(r'"model"\s*:\s*' + model)
+                and child_count(r'"tools"\s*:\s*' + re.escape(json.dumps(",".join(CORE_TOOLS))))
+                and child_count(r'"cwd"\s*:\s*' + expected_cwd)
+                and child_count(r'"timeoutMs"\s*:\s*' + str(expected_timeout))
+                and child_count(r'"context"\s*:\s*"fresh"')
+                and child_count(r'"worktree"\s*:\s*false')
+            )
+        reason = "three isolated subagent launches match model, tools, cwd, and deadline" if valid else "subagent child loadout is unverified"
+        return {"verified": valid, "tool_calls": [name for name, _ in calls], "reason": reason}
     return {"verified": True, "tool_calls": [name for name, _ in calls], "reason": "stock Pi has no delegated children"}
 
 
@@ -634,7 +663,20 @@ def preflight(cache_root: Path, pi_binary: str = PI_BINARY, source_env: dict[str
 
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False,
+        ) as output:
+            temporary_path = Path(output.name)
+            output.write(json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def _seed_hash() -> str:
@@ -655,6 +697,13 @@ def run_cell(
     package_paths = {key: value["entry"] for key, value in packages.items()}
     prompt = build_prompt(case, arm, project, deadline_seconds)
     command = build_command(arm, prompt, session_dir, package_paths, pi_binary)
+    extension_args = [command[i + 1] for i, arg in enumerate(command[:-1]) if arg == "-e"]
+    if arm == "stock":
+        parent_loadout_verified = "--no-extensions" in command and not extension_args
+    else:
+        parent_loadout_verified = (
+            "--no-extensions" not in command and extension_args == [package_paths[arm]]
+        )
     (cell_dir / "prompt.txt").write_text(prompt)
     _write_json(cell_dir / "argv.json", command)
     environment_info = {
@@ -669,9 +718,9 @@ def run_cell(
     )
     events, malformed = read_events(cell_dir / "events.jsonl")
     agent = parse_events(events, result["exit_code"])
-    children = extract_children(events)
+    children = extract_children(events, arm=arm)
     overlap = overlap_summary(children)
-    launches = child_launch_evidence(arm, events)
+    launches = child_launch_evidence(arm, events, case, project, deadline_seconds)
     child_usage_records = [item["usage"] for item in children if isinstance(item.get("usage"), dict)]
     child_usage = _sum_usage(child_usage_records)
     if len(child_usage_records) != len(children):
@@ -688,8 +737,19 @@ def run_cell(
     parent_cost, child_cost = agent["usage"].get("cost_usd"), child_usage.get("cost_usd")
     if isinstance(parent_cost, (int, float)) and (arm == "stock" or isinstance(child_cost, (int, float))):
         usage["cost_usd"] = parent_cost + (child_cost or 0)
-    grader = _grade(case, project, agent["answer"])
+    interrupted = result.get("interrupted", False)
+    if interrupted:
+        grader = {"passed": False, "errors": ["grading skipped because the cell was interrupted"]}
+    else:
+        try:
+            grader = _grade(case, project, agent["answer"])
+        except Exception as error:
+            grader = {"passed": False, "errors": [f"grader error: {error}"]}
     failures = []
+    if interrupted:
+        failures.append("cell interrupted")
+    if not parent_loadout_verified:
+        failures.append("parent extension loadout is unverified")
     if result["timed_out"]:
         failures.append("deadline exceeded")
     if not agent["success"]:
@@ -719,7 +779,8 @@ def run_cell(
         "final_stop_reason": agent["final_stop_reason"], "answer": agent["answer"],
         "grader": grader, "seed_sha256": _seed_hash(),
         "parent_extensions": [] if arm == "stock" else [packages[arm]["entry"]],
-        "parent_loadout_verified": True, "child_loadout": launches,
+        "parent_loadout_verified": parent_loadout_verified,
+        "child_loadout": launches,
         "packages": {key: value for key, value in packages.items() if key == arm},
         "children": children, "overlap": overlap, "usage": usage,
         "environment": environment_info,
@@ -739,6 +800,240 @@ def _new_run_dir(cache_root: Path) -> Path:
     return private_dir(cache_root / "runs" / f"{stamp}-{uuid.uuid4().hex[:8]}")
 
 
+def _cell_passed(cell: dict[str, Any]) -> bool:
+    elapsed = cell.get("elapsed_ms")
+    return (cell.get("status") == "passed" and cell.get("correct") is True
+            and isinstance(elapsed, (int, float)) and elapsed >= 0)
+
+
+def _usage_field(cell: dict[str, Any], field: str) -> int | float | None:
+    usage = cell.get("usage", {})
+    direct = usage.get(field)
+    if isinstance(direct, (int, float)):
+        return direct
+    parent, children = usage.get("parent", {}), usage.get("children", {})
+    parent_value = parent.get(field) if isinstance(parent, dict) else None
+    child_value = 0 if cell.get("arm") == "stock" else (children.get(field) if isinstance(children, dict) else None)
+    if isinstance(parent_value, (int, float)) and isinstance(child_value, (int, float)):
+        return parent_value + child_value
+    return None
+
+
+def _report_usage(cells: list[dict[str, Any]], planned: int) -> dict[str, Any]:
+    known = [cell for cell in cells
+             if isinstance(cell.get("usage"), dict) and cell["usage"].get("known")]
+    complete = len(cells) == planned and len(known) == planned
+    cost_known = [cell["usage"]["cost_usd"] for cell in known
+                  if isinstance(cell["usage"].get("cost_usd"), (int, float))]
+    cost_complete = len(cells) == planned and len(cost_known) == planned
+    result = {
+        "complete": complete, "known_cells": len(known),
+        "unknown_cells": max(0, planned - len(known)),
+        "total_tokens": None, "input_tokens": None, "output_tokens": None,
+        "cost_complete": cost_complete, "cost_known_cells": len(cost_known),
+        "cost_usd": None,
+    }
+    if complete:
+        for field in ("total_tokens", "input_tokens", "output_tokens"):
+            values = [_usage_field(cell, field) for cell in known]
+            if all(isinstance(value, (int, float)) for value in values):
+                result[field] = sum(values)
+    if cost_complete:
+        result["cost_usd"] = sum(cost_known)
+    return result
+
+
+def build_report(
+    cells: list[dict[str, Any]], repetitions: int,
+    cases: tuple[str, ...] | list[str] = CASES,
+    arms: tuple[str, ...] | list[str] = ARMS,
+    repetition_ids: tuple[int, ...] | list[int] | None = None,
+) -> dict[str, Any]:
+    if repetitions < 1:
+        raise ValueError("repetitions must be positive")
+    repetition_ids = tuple(range(1, repetitions + 1) if repetition_ids is None else repetition_ids)
+    if len(repetition_ids) != repetitions:
+        raise ValueError("repetition IDs must match planned repetitions")
+    cases, arms = tuple(cases), tuple(arms)
+    indexed = {(cell.get("case"), cell.get("arm"), cell.get("repetition")): cell for cell in cells}
+    case_reports: dict[str, Any] = {}
+    failed_cells, missing_cells = [], []
+    for case in cases:
+        arm_reports: dict[str, Any] = {}
+        for arm in arms:
+            selected = [cell for cell in cells if cell.get("case") == case and cell.get("arm") == arm]
+            good = [cell for cell in selected if _cell_passed(cell)]
+            planned = repetitions
+            arm_reports[arm] = {
+                "planned": planned, "attempted": len(selected), "passed": len(good),
+                "failed": len(selected) - len(good),
+                "not_run": max(0, planned - len(selected)),
+                "success_rate": len(good) / planned,
+                "median_elapsed_ms": statistics.median([cell["elapsed_ms"] for cell in good]) if good else None,
+                "usage": _report_usage(selected, planned),
+            }
+            for cell in selected:
+                if not _cell_passed(cell):
+                    failed_cells.append({
+                        "case": case, "arm": arm, "repetition": cell.get("repetition"),
+                        "status": cell.get("status", "unknown"),
+                        "failures": cell.get("failures", []),
+                        "cell": cell.get("artifacts", {}).get("cell"),
+                    })
+            for repetition in repetition_ids:
+                if (case, arm, repetition) not in indexed:
+                    missing_cells.append({"case": case, "arm": arm, "repetition": repetition})
+        baseline = {
+            cell.get("repetition"): cell for cell in cells
+            if cell.get("case") == case and cell.get("arm") == "stock" and _cell_passed(cell)
+        }
+        paired: dict[str, Any] = {}
+        for arm in arms:
+            if arm == "stock":
+                continue
+            ratios, base_times, arm_times = [], [], []
+            for cell in cells:
+                repetition = cell.get("repetition")
+                base = baseline.get(repetition)
+                elapsed = cell.get("elapsed_ms")
+                if (cell.get("case") == case and cell.get("arm") == arm and base
+                        and _cell_passed(cell) and isinstance(elapsed, (int, float)) and elapsed > 0):
+                    base_times.append(base["elapsed_ms"])
+                    arm_times.append(elapsed)
+                    ratios.append(base["elapsed_ms"] / elapsed)
+            paired[arm] = {
+                "pairs": len(ratios),
+                "median_speedup": statistics.median(ratios) if ratios else None,
+                "median_stock_elapsed_ms": statistics.median(base_times) if base_times else None,
+                "median_arm_elapsed_ms": statistics.median(arm_times) if arm_times else None,
+            }
+        case_reports[case] = {
+            "repetitions": repetitions, "arms": arm_reports,
+            "paired_speedup": paired,
+        }
+    summaries = [{
+        "case": cell.get("case"), "arm": cell.get("arm"),
+        "repetition": cell.get("repetition"), "status": cell.get("status"),
+        "correct": cell.get("correct"), "elapsed_ms": cell.get("elapsed_ms"),
+        "usage": cell.get("usage"), "overlap": cell.get("overlap"),
+        "failures": cell.get("failures", []),
+        "cell": cell.get("artifacts", {}).get("cell"),
+    } for cell in cells]
+    return {
+        "schema_version": 1, "cases": case_reports,
+        "planned_cells": repetitions * len(cases) * len(arms),
+        "recorded_cells": len(cells), "passed_cells": sum(_cell_passed(cell) for cell in cells),
+        "failed_cells": failed_cells, "missing_cells": missing_cells, "cells": summaries,
+    }
+
+
+def _load_cells(run_dir: Path) -> list[dict[str, Any]]:
+    return [json.loads(path.read_text()) for path in sorted(run_dir.glob("cells/*/cell.json"))]
+
+
+def _create_run(
+    cache_root: Path, mode: str, cases: list[str], arms: list[str], repetitions: int,
+    deadline_seconds: int, check: dict[str, Any], repetition_ids: list[int] | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    run_dir = _new_run_dir(cache_root)
+    manifest = {
+        "schema_version": 1, "run_id": run_dir.name, "mode": mode,
+        "state": "running", "cases": cases, "arms": arms,
+        "repetitions": repetitions,
+        "repetition_ids": repetition_ids if repetition_ids is not None else list(range(1, repetitions + 1)),
+        "deadline_seconds": deadline_seconds,
+        "provider": PROVIDER, "model": MODEL, "thinking": THINKING,
+        "child_cap": CHILD_CAP, "core_tools": list(CORE_TOOLS),
+        "preflight": check, "started_at": datetime.now(timezone.utc).isoformat(),
+        "completed_cells": [],
+    }
+    _write_json(run_dir / "preflight.json", check)
+    _write_json(run_dir / "run.json", manifest)
+    return run_dir, manifest
+
+
+def _save_report(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    report = build_report(
+        _load_cells(run_dir), manifest["repetitions"],
+        manifest["cases"], manifest["arms"], manifest.get("repetition_ids"),
+    )
+    report.update({
+        "run_id": manifest["run_id"], "run_dir": str(run_dir.resolve()),
+        "mode": manifest["mode"], "state": manifest["state"],
+        "preflight_passed": manifest["preflight"].get("passed", False),
+    })
+    _write_json(run_dir / "report.json", report)
+    _write_json(run_dir / "run.json", manifest)
+    return report
+
+
+def _failed_cell(run_dir: Path, case: str, arm: str, repetition: int, error: Exception) -> dict[str, Any]:
+    cell_dir = private_dir(run_dir / "cells" / f"{case}-{arm}-r{repetition:02d}")
+    record = {
+        "case": case, "arm": arm, "repetition": repetition,
+        "status": "failed", "correct": False,
+        "failures": [f"runner error: {error}"],
+        "termination_reason": "runner_error", "artifacts": {"cell": str(cell_dir)},
+    }
+    _write_json(cell_dir / "cell.json", record)
+    return record
+
+
+def _attempt_cell(
+    run_dir: Path, case: str, arm: str, repetition: int, deadline_seconds: int,
+    packages: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    try:
+        return run_cell(run_dir, case, arm, repetition, deadline_seconds, packages)
+    except Exception as error:
+        return _failed_cell(run_dir, case, arm, repetition, error)
+
+
+def _record_attempt(manifest: dict[str, Any], record: dict[str, Any], run_dir: Path) -> None:
+    manifest["completed_cells"].append({
+        "case": record["case"], "arm": record["arm"],
+        "repetition": record["repetition"], "status": record["status"],
+    })
+    _write_json(run_dir / "run.json", manifest)
+
+
+def _rotated_arms(offset: int) -> list[str]:
+    index = offset % len(ARMS)
+    return list(ARMS[index:] + ARMS[:index])
+
+
+def matrix_schedule(cases: list[str], repetitions: int) -> list[tuple[str, str, int]]:
+    if repetitions < 3:
+        raise ValueError("matrix requires at least 3 repetitions")
+    if not cases:
+        raise ValueError("at least one case is required")
+    schedule = [(cases[0], arm, 1) for arm in _rotated_arms(0)]
+    for repetition in range(1, repetitions + 1):
+        for case_index, case in enumerate(cases):
+            if repetition == 1 and case_index == 0:
+                continue
+            schedule.extend((case, arm, repetition)
+                            for arm in _rotated_arms(repetition - 1 + case_index))
+    return schedule
+
+
+def _run_cells(
+    run_dir: Path, manifest: dict[str, Any], check: dict[str, Any],
+    cells: list[tuple[str, str, int]], deadline_seconds: int,
+) -> list[dict[str, Any]]:
+    records = []
+    for case, arm, repetition in cells:
+        record = _attempt_cell(run_dir, case, arm, repetition, deadline_seconds, check["package_info"])
+        records.append(record)
+        interrupted = record.get("termination_reason") == "interrupted"
+        if interrupted:
+            manifest["state"] = "interrupted"
+        _record_attempt(manifest, record, run_dir)
+        if interrupted:
+            break
+    return records
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache-root", type=Path, default=default_cache_root())
@@ -750,8 +1045,15 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--arm", choices=ARMS, required=True)
     run.add_argument("--repetition", type=int, default=1)
     run.add_argument("--deadline", type=int, default=DEFAULT_DEADLINE)
+    smoke = commands.add_parser("smoke", help="run one triage cell per arm")
+    smoke.add_argument("--deadline", type=int, default=DEFAULT_DEADLINE)
+    matrix = commands.add_parser("matrix", help="run paired repetitions for each case")
+    matrix.add_argument("--repetitions", type=int, default=3, help="repetitions per case and arm (minimum 3)")
+    matrix.add_argument("--deadline", type=int, default=DEFAULT_DEADLINE)
+    matrix.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES))
     report = commands.add_parser("report", help="summarize saved cell.json files")
     report.add_argument("run_dir", type=Path)
+    report.add_argument("--repetitions", type=int)
     return parser
 
 
@@ -767,25 +1069,96 @@ def main(argv: list[str] | None = None) -> int:
             result = preflight(cache_root)
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0 if result["passed"] else 1
+        if args.command == "report":
+            run_dir = args.run_dir.expanduser().resolve()
+            manifest_path = run_dir / "run.json"
+            try:
+                manifest = json.loads(manifest_path.read_text())
+            except FileNotFoundError:
+                manifest = {}
+            cells = _load_cells(run_dir)
+            cases = manifest.get("cases") or sorted({cell["case"] for cell in cells}) or list(CASES)
+            arms = manifest.get("arms") or list(ARMS)
+            repetitions = (args.repetitions if args.repetitions is not None
+                           else manifest.get("repetitions") or max(
+                               (cell.get("repetition", 0) for cell in cells), default=1))
+            repetition_ids = manifest.get("repetition_ids") if args.repetitions is None else None
+            result = build_report(cells, repetitions, cases, arms, repetition_ids)
+            result.update({"run_dir": str(run_dir), "run_id": manifest.get("run_id"),
+                           "mode": manifest.get("mode"), "state": manifest.get("state")})
+            _write_json(run_dir / "report.json", result)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
         if args.command == "run":
             if args.deadline < 1 or args.repetition < 1:
                 raise ValueError("deadline and repetition must be positive")
             check = preflight(cache_root)
+            run_dir, manifest = _create_run(
+                cache_root, "single", [args.case], [args.arm], 1, args.deadline, check,
+                [args.repetition],
+            )
             if not check["passed"]:
-                print(json.dumps(check, indent=2, sort_keys=True))
+                manifest["state"] = "blocked_preflight"
+                report = _save_report(run_dir, manifest)
+                print(json.dumps(report, indent=2, sort_keys=True))
                 return 1
-            run_dir = _new_run_dir(cache_root)
-            _write_json(run_dir / "preflight.json", check)
-            record = run_cell(run_dir, args.case, args.arm, args.repetition,
-                              args.deadline, check["package_info"])
-            print(json.dumps(record, indent=2, sort_keys=True))
-            return 0 if record["status"] == "passed" else 1
-        if args.command == "report":
-            cells = [json.loads(path.read_text()) for path in sorted(args.run_dir.glob("cells/*/cell.json"))]
-            result = {"run_dir": str(args.run_dir.resolve()), "cells": cells,
-                      "attempted": len(cells), "passed": sum(c["status"] == "passed" for c in cells)}
-            print(json.dumps(result, indent=2, sort_keys=True))
-            return 0
+            record = _run_cells(
+                run_dir, manifest, check, [(args.case, args.arm, args.repetition)], args.deadline
+            )[0]
+            if manifest["state"] != "interrupted":
+                manifest["state"] = "complete"
+            report = _save_report(run_dir, manifest)
+            print(json.dumps({"record": record, "report": report}, indent=2, sort_keys=True))
+            return 130 if manifest["state"] == "interrupted" else 0 if _cell_passed(record) else 1
+        if args.command == "smoke":
+            if args.deadline < 1:
+                raise ValueError("deadline must be positive")
+            check = preflight(cache_root)
+            run_dir, manifest = _create_run(
+                cache_root, "smoke", ["triage"], list(ARMS), 1, args.deadline, check
+            )
+            if not check["passed"]:
+                manifest["state"] = "blocked_preflight"
+            else:
+                cells = _run_cells(run_dir, manifest, check,
+                                   [("triage", arm, 1) for arm in _rotated_arms(0)], args.deadline)
+                if manifest["state"] != "interrupted":
+                    manifest["state"] = "complete" if all(_cell_passed(cell) for cell in cells) else "smoke_failed"
+            report = _save_report(run_dir, manifest)
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 130 if manifest["state"] == "interrupted" else 0 if manifest["state"] == "complete" else 1
+        if args.command == "matrix":
+            if args.deadline < 1 or args.repetitions < 3:
+                raise ValueError("matrix requires a positive deadline and at least 3 repetitions")
+            cases = list(dict.fromkeys(args.cases))
+            if not cases:
+                raise ValueError("at least one case is required")
+            check = preflight(cache_root)
+            run_dir, manifest = _create_run(
+                cache_root, "matrix", cases, list(ARMS), args.repetitions, args.deadline, check
+            )
+            if not check["passed"]:
+                manifest["state"] = "blocked_preflight"
+                report = _save_report(run_dir, manifest)
+                print(json.dumps(report, indent=2, sort_keys=True))
+                return 1
+            schedule = matrix_schedule(cases, args.repetitions)
+            smoke = _run_cells(run_dir, manifest, check, schedule[:len(ARMS)], args.deadline)
+            if manifest["state"] == "interrupted" or not all(_cell_passed(cell) for cell in smoke):
+                if manifest["state"] != "interrupted":
+                    manifest["state"] = "smoke_failed"
+                report = _save_report(run_dir, manifest)
+                print(json.dumps(report, indent=2, sort_keys=True))
+                return 130 if manifest["state"] == "interrupted" else 1
+            for cell in schedule[len(ARMS):]:
+                _run_cells(run_dir, manifest, check, [cell], args.deadline)
+                if manifest["state"] == "interrupted":
+                    break
+            if manifest["state"] != "interrupted":
+                manifest["state"] = "complete"
+            report = _save_report(run_dir, manifest)
+            print(json.dumps(report, indent=2, sort_keys=True))
+            return 130 if manifest["state"] == "interrupted" else 0 if not report["failed_cells"] and not report["missing_cells"] else 1
     except Exception as error:
         print(json.dumps({"passed": False, "error": str(error)}), file=sys.stderr)
         return 2
