@@ -1,0 +1,13 @@
+{
+  "findings": {
+    "catalog": {"buggy_expression": "stock + reserved", "correct_expression": "max(0, stock - reserved)", "observed_available_units": 15, "expected_available_units": 7},
+    "billing": {"buggy_expression": "unit_price_cents + quantity", "correct_expression": "unit_price_cents * quantity", "observed_subtotal_cents": 1254, "expected_subtotal_cents": 5000},
+    "shipping": {"buggy_expression": "subtotal_cents > free_threshold_cents", "correct_expression": "subtotal_cents >= free_threshold_cents", "observed_fee_at_threshold_cents": 599, "expected_fee_at_threshold_cents": 0}
+  },
+  "conclusion": {
+    "order_fulfillable": true,
+    "available_units": 7,
+    "subtotal_cents": 5000,
+    "shipping_fee_cents": 0
+  }
+}
