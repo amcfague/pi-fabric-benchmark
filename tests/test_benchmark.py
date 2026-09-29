@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import benchmark
@@ -22,6 +23,7 @@ from benchmark import (
     _write_json,
     build_command,
     build_report,
+    render_markdown,
     matrix_schedule,
     child_launch_evidence,
     extract_children,
@@ -65,6 +67,12 @@ class LauncherChecks(unittest.TestCase):
                 self.assertEqual(command[command.index('--model') + 1], 'gpt-6-sol')
                 self.assertEqual(command[command.index('--thinking') + 1], 'xhigh')
                 self.assertEqual(command[command.index('--session-dir') + 1], '/cell/session')
+                expected_tools = {
+                    'stock': 'read,grep,find,ls,bash,edit,write',
+                    'subagents': 'read,grep,find,ls,bash,edit,write,subagents_enable,subagent',
+                    'fabric': 'read,grep,find,ls,bash,edit,write,fabric_exec',
+                }
+                self.assertEqual(command[command.index('--tools') + 1], expected_tools[arm])
                 extensions = [command[i + 1] for i, arg in enumerate(command[:-1])
                               if arg in ('-e', '--extension')]
                 if arm == 'stock':
@@ -81,15 +89,88 @@ class LauncherChecks(unittest.TestCase):
                 'http_proxy': 'http://proxy', 'https_proxy': 'https://proxy',
                 'PI_CODING_AGENT_DIR': '/home/operator/.pi',
             }
-            env = build_environment(Path(tmp) / 'cell', base, '/usr/local/bin/pi')
+            runtime_root = '/cache/subagents/node_modules/@earendil-works/pi-coding-agent'
+            env = build_environment(
+                Path(tmp) / 'cell', base, '/usr/local/bin/pi', runtime_root,
+            )
             self.assertEqual(env['PATH'].split(os.pathsep)[0], '/usr/local/bin')
-            self.assertEqual(env['OPENAI_API_KEY'], 'test-secret')
+            self.assertNotIn('OPENAI_API_KEY', env)
             self.assertNotIn('ANTHROPIC_API_KEY', env)
             self.assertEqual(env['http_proxy'], 'http://proxy')
             self.assertEqual(env['https_proxy'], 'https://proxy')
             self.assertNotEqual(env['PI_CODING_AGENT_DIR'], '/home/operator/.pi')
             self.assertEqual(env['PI_SUBAGENT_PI_BINARY'], '/usr/local/bin/pi')
             self.assertEqual(env['PI_FABRIC_PI_BINARY'], '/usr/local/bin/pi')
+            settings = json.loads((Path(env['PI_CODING_AGENT_DIR']) / 'settings.json').read_text())
+            self.assertEqual(
+                settings['subagents']['agentOverrides']['worker']['thinking'], 'xhigh',
+            )
+
+    def test_preflight_accepts_wrapper_auth_without_openai_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            packages = {
+                arm: {'sha256': 'package-hash', 'integrity': PINS[arm]['integrity']}
+                for arm in PINS
+            }
+            host_pin = benchmark.SUBAGENT_RUNTIME_PIN
+            packages['subagents']['host_runtime'] = {
+                'sha256': 'runtime-hash', 'version': host_pin['version'],
+                'integrity': host_pin['integrity'],
+            }
+            (cache / 'package-manifest.json').write_text(json.dumps({'packages': packages}))
+            integrities = {
+                f"{pin['name']}@{pin['version']}": pin['integrity']
+                for pin in PINS.values()
+            }
+            integrities[f"{host_pin['name']}@{host_pin['version']}"] = host_pin['integrity']
+            cli = [
+                SimpleNamespace(returncode=0, stdout='0.87.1\n'),
+                SimpleNamespace(
+                    returncode=0,
+                    stdout='--mode --provider --model --thinking --session-dir --tools '
+                           '--no-extensions --no-skills --no-prompt-templates --no-themes '
+                           '--no-context-files --no-approve',
+                ),
+            ]
+            with patch('benchmark.validate_pi_binary'), \
+                    patch('benchmark.subprocess.run', side_effect=cli), \
+                    patch('benchmark.npm_integrity', side_effect=integrities.__getitem__), \
+                    patch('benchmark.inspect_package', return_value={
+                        'sha256': 'package-hash', 'integrity_verified': True,
+                    }), \
+                    patch('benchmark.inspect_subagents_runtime', return_value={
+                        'sha256': 'runtime-hash', 'version': host_pin['version'],
+                        'integrity': host_pin['integrity'], 'integrity_verified': True,
+                        'root': '/cache/runtime',
+                    }):
+                result = benchmark.preflight(cache, '/usr/local/bin/pi', source_env={})
+
+            self.assertTrue(result['passed'], result['errors'])
+            self.assertNotIn('credential_present', result)
+
+    def test_subagents_host_runtime_is_pinned_for_foreground_children(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            prefix = cache / 'packages' / 'subagents'
+            runtime = prefix / 'node_modules' / '@earendil-works' / 'pi-coding-agent'
+            runtime.mkdir(parents=True)
+            pin = benchmark.SUBAGENT_RUNTIME_PIN
+            (runtime / 'package.json').write_text(json.dumps({
+                'name': pin['name'], 'version': pin['version'],
+            }))
+            (prefix / 'package-lock.json').write_text(json.dumps({
+                'packages': {'node_modules/@earendil-works/pi-coding-agent': {
+                    'integrity': pin['integrity'],
+                }},
+            }))
+            info = benchmark.inspect_subagents_runtime(cache)
+            self.assertTrue(info['integrity_verified'])
+            self.assertEqual(info['version'], '0.87.1')
+            env = build_environment(
+                cache / 'cell', {}, '/usr/local/bin/pi', info['root'],
+            )
+            self.assertEqual(env['PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT'], info['root'])
 
     def test_pi_real_requires_both_lowercase_proxy_variables(self):
         with self.assertRaises(ValueError):
@@ -112,6 +193,16 @@ class LauncherChecks(unittest.TestCase):
         self.assertIn('runs.all', subagents)
         self.assertIn('extensions: []', subagents)
         self.assertIn('skills: []', subagents)
+        self.assertIn('inherits the parent provider and model', subagents)
+        self.assertIn('private cell worker settings match the parent thinking level', subagents)
+        self.assertIn('sets acceptance to none', subagents)
+        self.assertIn('Pass no per-run model or thinking override', subagents)
+        self.assertIn('returned sessionFile', subagents)
+        self.assertIn('Never read fixture source in the parent', subagents)
+        self.assertIn('async=false', subagents)
+        self.assertNotIn('bg_wait', subagents)
+        self.assertNotIn('output-archives', subagents)
+        self.assertIn('before fulfillment', build_prompt('triage', 'stock', Path('/cell/project')))
         self.assertIn('child cap is 3', subagents)
         fabric = build_prompt('patch', 'fabric', Path('/cell/project'))
         self.assertIn('agents.run', fabric)
@@ -162,6 +253,18 @@ class LauncherChecks(unittest.TestCase):
             self.assertEqual(json.loads((root / 'events.jsonl').read_text())['type'],
                              'agent_settled')
 
+    def test_read_events_ignores_headroom_relay_marker_but_counts_other_corruption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            events_path = Path(tmp) / 'events.jsonl'
+            events_path.write_text(
+                '{"type":"agent_start"}\n'
+                '[mcporter] stderr from headroom\n'
+                'not-json\n'
+            )
+            events, malformed = benchmark.read_events(events_path)
+        self.assertEqual(events, [{'type': 'agent_start'}])
+        self.assertEqual(malformed, 1)
+
     @unittest.skipUnless(os.name == 'posix', 'process groups require POSIX')
     def test_deadline_terminates_the_entire_process_group(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -205,10 +308,21 @@ class LauncherChecks(unittest.TestCase):
                 'pi': {'extensions': ['./index.js']},
             }))
             (package / 'index.js').write_text('// pinned fake entry')
+            runtime = prefix / 'node_modules' / '@earendil-works' / 'pi-coding-agent'
+            runtime.mkdir(parents=True)
+            host_pin = benchmark.SUBAGENT_RUNTIME_PIN
+            (runtime / 'package.json').write_text(json.dumps({
+                'name': host_pin['name'], 'version': host_pin['version'],
+            }))
             (prefix / 'package-lock.json').write_text(json.dumps({
-                'packages': {'node_modules/pi-subagents': {
-                    'integrity': PINS['subagents']['integrity'],
-                }},
+                'packages': {
+                    'node_modules/pi-subagents': {
+                        'integrity': PINS['subagents']['integrity'],
+                    },
+                    'node_modules/@earendil-works/pi-coding-agent': {
+                        'integrity': host_pin['integrity'],
+                    },
+                },
             }))
             info = inspect_package('subagents', cache)
             self.assertTrue(info['integrity_verified'])
@@ -216,83 +330,215 @@ class LauncherChecks(unittest.TestCase):
             self.assertEqual(info['version'], '0.73.1')
             project_dir = Path('/cell/project')
             deadline = 900
+            raw_children = {'children': [
+                {'key': 'catalog', 'startedAt': 100, 'endedAt': 300,
+                 'result': {'runnerSessionId': 's1', 'usage': {'input': 1, 'output': 2}}},
+                {'key': 'billing', 'startedAt': 200, 'endedAt': 400,
+                 'result': {'runnerSessionId': 's2', 'usage': {'input': 3, 'output': 4}}},
+                {'key': 'shipping', 'startedAt': 400, 'endedAt': 500,
+                 'result': {'runnerSessionId': 's3', 'usage': {'input': 5, 'output': 6}}},
+            ]}
+            encoded = json.dumps(raw_children)
             subagent_prompt = build_prompt('triage', 'subagents', project_dir, deadline)
             subagent_script = json.loads(
                 subagent_prompt.partition('workflowScript = ')[2].splitlines()[0]
             )
-            subagent_event = [{
-                'type': 'tool_execution_start', 'toolName': 'subagent',
-                'args': {'workflowScript': subagent_script},
-            }]
+            self.assertNotIn('\"model\":', subagent_script)
+            self.assertEqual(subagent_script.count('\"async\":false'), 3)
+            self.assertEqual(subagent_script.count('\"acceptance\":{\"level\":\"none\",\"reason\":\"Read-only benchmark output is checked by the parent grader\"}'), 3)
+            subagent_events = [
+                {'type': 'tool_execution_start', 'toolCallId': 'enable',
+                 'toolName': 'subagents_enable', 'args': {}},
+                {'type': 'tool_execution_end', 'toolCallId': 'enable',
+                 'toolName': 'subagents_enable', 'result': {'content': []}, 'isError': False},
+                {'type': 'tool_execution_start', 'toolCallId': 'agent-list',
+                 'toolName': 'subagent', 'args': {'action': 'list', 'capabilities': True}},
+                {'type': 'tool_execution_end', 'toolCallId': 'agent-list',
+                 'toolName': 'subagent', 'result': {'content': []}, 'isError': False},
+                {'type': 'tool_execution_start', 'toolCallId': 'workflow-1',
+                 'toolName': 'subagent', 'args': {
+                     'workflowScript': subagent_script, 'cwd': str(project_dir),
+                     'async': False, 'timeoutMs': deadline * 1000, 'mission': False,
+                 }},
+                {'type': 'tool_execution_end', 'toolCallId': 'workflow-1',
+                 'toolName': 'subagent', 'result': {
+                     'content': [{'type': 'text', 'text': encoded + '\nchildren:\n'}],
+                     'details': {},
+                 }, 'isError': False},
+            ]
+            workflow_start = next(
+                i for i, event in enumerate(subagent_events)
+                if event.get('toolCallId') == 'workflow-1' and event.get('type') == 'tool_execution_start'
+            )
             self.assertTrue(child_launch_evidence(
-                'subagents', subagent_event, 'triage', project_dir, deadline)['verified'])
+                'subagents', subagent_events, 'triage', project_dir, deadline)['verified'])
+            source_read = subagent_events + [
+                {'type': 'tool_execution_start', 'toolCallId': 'parent-read',
+                 'toolName': 'read', 'args': {'path': str(project_dir / 'catalog.py')}},
+            ]
             self.assertFalse(child_launch_evidence(
-                'subagents', subagent_event * 2, 'triage', project_dir, deadline)['verified'])
+                'subagents', source_read, 'triage', project_dir, deadline)['verified'])
+            bad_async_events = list(subagent_events)
+            bad_async_events[workflow_start] = {
+                **bad_async_events[workflow_start],
+                'args': {**bad_async_events[workflow_start]['args'], 'async': True},
+            }
+            self.assertFalse(child_launch_evidence(
+                'subagents', bad_async_events, 'triage', project_dir, deadline)['verified'])
+            subagent_children = extract_children(subagent_events, arm='subagents')
+            self.assertEqual(subagent_children, [])
+            self.assertFalse(overlap_summary(subagent_children)['evidenced'])
+            self.assertFalse(child_launch_evidence(
+                'subagents', subagent_events[:2], 'triage', project_dir, deadline)['verified'])
+            self.assertFalse(child_launch_evidence(
+                'subagents', subagent_events + subagent_events[workflow_start:workflow_start + 2], 'triage', project_dir, deadline)['verified'])
+            bad_subagent_events = list(subagent_events)
             bad_subagent_script = subagent_script.replace(
                 '"extensions":[]', '"extensions":["unrelated"]', 1)
-            self.assertFalse(child_launch_evidence('subagents', [{
-                'type': 'tool_execution_start', 'toolName': 'subagent',
-                'args': {'workflowScript': bad_subagent_script},
-            }], 'triage', project_dir, deadline)['verified'])
+            bad_subagent_events[workflow_start] = {
+                **bad_subagent_events[workflow_start],
+                'args': {**bad_subagent_events[workflow_start]['args'], 'workflowScript': bad_subagent_script},
+            }
             self.assertFalse(child_launch_evidence(
-                'subagents', subagent_event, 'patch', project_dir, deadline)['verified'])
+                'subagents', bad_subagent_events, 'triage', project_dir, deadline)['verified'])
+            self.assertFalse(child_launch_evidence(
+                'subagents', subagent_events, 'patch', project_dir, deadline)['verified'])
             fabric_prompt = build_prompt('patch', 'fabric', project_dir, deadline)
             fabric_script = json.loads(
                 fabric_prompt.partition('fabric_exec code = ')[2].splitlines()[0]
             )
-            fabric_event = [{
-                'type': 'tool_execution_start', 'toolName': 'fabric_exec',
-                'args': {'code': fabric_script},
-            }]
-            self.assertFalse(child_launch_evidence(
+            fabric_event = [
+                {'type': 'tool_execution_start', 'toolCallId': 'fabric-1',
+                 'toolName': 'fabric_exec', 'args': {'code': fabric_script}},
+                {'type': 'tool_execution_end', 'toolCallId': 'fabric-1',
+                 'toolName': 'fabric_exec',
+                 'result': {'content': [{'type': 'text', 'text': encoded + '\nchildren:\n'}], 'details': {}},
+                 'isError': False},
+            ]
+            self.assertTrue(child_launch_evidence(
                 'fabric', fabric_event, 'patch', project_dir, deadline)['verified'])
             self.assertFalse(child_launch_evidence(
                 'fabric', fabric_event * 2, 'patch', project_dir, deadline)['verified'])
             bad_fabric_script = fabric_script.replace('extensions: false', 'extensions: true', 1)
-            self.assertFalse(child_launch_evidence('fabric', [{
-                'type': 'tool_execution_start', 'toolName': 'fabric_exec',
-                'args': {'code': bad_fabric_script},
-            }], 'patch', project_dir, deadline)['verified'])
+            bad_fabric_event = list(fabric_event)
+            bad_fabric_event[0] = {
+                **bad_fabric_event[0], 'args': {'code': bad_fabric_script},
+            }
+            self.assertFalse(child_launch_evidence(
+                'fabric', bad_fabric_event, 'patch', project_dir, deadline)['verified'])
             self.assertFalse(child_launch_evidence(
                 'fabric', fabric_event, 'triage', project_dir, deadline)['verified'])
-            raw_children = {'children': [
-                {'key': 'a', 'startedAt': 100, 'endedAt': 300,
-                 'result': {'runnerSessionId': 's1', 'usage': {'input': 1, 'output': 2}}},
-                {'key': 'b', 'startedAt': 200, 'endedAt': 400,
-                 'result': {'runnerSessionId': 's2', 'usage': {'input': 3, 'output': 4}}},
-                {'key': 'c', 'startedAt': 400, 'endedAt': 500,
-                 'result': {'runnerSessionId': 's3', 'usage': {'input': 5, 'output': 6}}},
-            ]}
-            encoded = json.dumps(raw_children)
-            fabric_result = {
-                'type': 'tool_execution_end', 'toolName': 'fabric_exec',
-                'result': {'text': encoded},
-            }
-            self.assertEqual(extract_children([fabric_result], arm='fabric'), [])
-            self.assertEqual(len(extract_children([fabric_result], arm='subagents')), 3)
+            fabric_children = extract_children(fabric_event, arm='fabric')
+            self.assertEqual(len(fabric_children), 3)
+            self.assertTrue(overlap_summary(fabric_children)['evidenced'])
+            self.assertTrue(all(child['usage']['known'] for child in fabric_children))
+            self.assertEqual(extract_children([fabric_event[1]], arm='fabric'), [])
+            failed_fabric_event = [fabric_event[0], {**fabric_event[1], 'isError': True}]
+            self.assertFalse(child_launch_evidence(
+                'fabric', failed_fabric_event, 'patch', project_dir, deadline)['verified'])
+            self.assertEqual(extract_children(failed_fabric_event, arm='fabric'), [])
 
-    def test_fabric_comments_and_returned_records_do_not_prove_child_execution(self):
+    def test_subagents_extract_output_and_native_intervals_from_returned_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cell = Path(tmp) / 'cell'
+            project_dir = cell / 'project'
+            session_dir = cell / 'session'
+            session_dir.mkdir(parents=True)
+            deadline = 900
+            keys = ('catalog', 'billing', 'shipping')
+            children, results, session_paths = [], [], []
+            for index, key in enumerate(keys):
+                started = f'2026-09-29T22:00:{index:02d}.000Z'
+                ended = f'2026-09-29T22:00:{index + 8:02d}.000Z'
+                session_file = session_dir / f'{key}.jsonl'
+                session_file.write_text('\n'.join(json.dumps(event) for event in [
+                    {'type': 'session', 'timestamp': started, 'version': 3},
+                    {'type': 'model_change', 'timestamp': started,
+                     'provider': 'openai', 'modelId': 'gpt-6-sol'},
+                    {'type': 'thinking_level_change', 'timestamp': started,
+                     'thinkingLevel': 'xhigh'},
+                    {'type': 'message', 'timestamp': ended, 'message': {
+                        'role': 'assistant', 'stopReason': 'stop',
+                        'content': [{'type': 'text', 'text': json.dumps({
+                            'module': f'{key}.py', 'finding': 'captured from child session',
+                        })}],
+                    }},
+                ]) + '\n')
+                session_paths.append(session_file)
+                children.append({'key': key, 'ok': True, 'runId': f'run-{key}', 'agent': 'worker'})
+                results.append({
+                    'workflowKey': key, 'sessionFile': str(session_file), 'exitCode': 0,
+                    'acceptance': {'status': 'none'},
+                    'model': 'openai/gpt-6-sol', 'thinking': 'xhigh',
+                    'usage': {'input': 10 + index, 'output': 5, 'cacheRead': 0,
+                              'cacheWrite': 0, 'cost': 0.001, 'turns': 2},
+                })
+            workflow_result = {
+                'content': [{'type': 'text', 'text': 'Workflow complete.\n\nReturn:\n' +
+                            json.dumps({'children': children})}],
+                'details': {'workflow': {'value': {'children': children}}, 'results': results},
+            }
+            prompt = build_prompt('triage', 'subagents', project_dir, deadline)
+            script = json.loads(prompt.partition('workflowScript = ')[2].splitlines()[0])
+            events = [
+                {'type': 'tool_execution_start', 'toolCallId': 'enable',
+                 'toolName': 'subagents_enable', 'args': {}},
+                {'type': 'tool_execution_end', 'toolCallId': 'enable',
+                 'toolName': 'subagents_enable', 'result': {'content': []}, 'isError': False},
+                {'type': 'tool_execution_start', 'toolCallId': 'list', 'toolName': 'subagent',
+                 'args': {'action': 'list', 'capabilities': True}},
+                {'type': 'tool_execution_end', 'toolCallId': 'list', 'toolName': 'subagent',
+                 'result': {'content': []}, 'isError': False},
+                {'type': 'tool_execution_start', 'toolCallId': 'workflow', 'toolName': 'subagent',
+                 'args': {'workflowScript': script, 'cwd': str(project_dir), 'async': False,
+                          'timeoutMs': deadline * 1000, 'mission': False}},
+                {'type': 'tool_execution_end', 'toolCallId': 'workflow', 'toolName': 'subagent',
+                 'result': workflow_result, 'isError': False},
+                {'type': 'tool_execution_start', 'toolCallId': 'session-read', 'toolName': 'read',
+                 'args': {'path': str(session_paths[0])}},
+            ]
+            self.assertTrue(child_launch_evidence(
+                'subagents', events, 'triage', project_dir, deadline)['verified'])
+            records = extract_children(events, 'subagents', session_dir)
+            self.assertEqual(len(records), 3)
+            self.assertTrue(overlap_summary(records)['evidenced'])
+            self.assertTrue(all(record['usage']['known'] for record in records))
+            failed_events = list(events)
+            failed_events[5] = {**failed_events[5], 'isError': True}
+            self.assertEqual(extract_children(failed_events, 'subagents', session_dir), [])
+            self.assertTrue(all(record['model'] == 'openai/gpt-6-sol' for record in records))
+            self.assertTrue(all(record['thinking'] == 'xhigh' for record in records))
+            self.assertEqual(json.loads(records[0]['output'])['module'], 'catalog.py')
+
+            rejected_result = json.loads(json.dumps(workflow_result))
+            rejected_result['details']['results'][0]['acceptance'] = {'status': 'rejected'}
+            rejected_events = list(events)
+            rejected_events[5] = {**rejected_events[5], 'result': rejected_result}
+            self.assertEqual(len(extract_children(rejected_events, 'subagents', session_dir)), 2)
+
+            outside = cell / 'outside.jsonl'
+            outside.write_text(session_paths[0].read_text())
+            bad_result = json.loads(json.dumps(workflow_result))
+            bad_result['details']['results'][0]['sessionFile'] = str(outside)
+            bad_events = list(events)
+            bad_events[5] = {**bad_events[5], 'result': bad_result}
+            self.assertEqual(len(extract_children(bad_events, 'subagents', session_dir)), 2)
+            self.assertFalse(child_launch_evidence(
+                'subagents', bad_events, 'triage', project_dir, deadline)['verified'])
+
+    def test_fabric_comment_wrapped_code_does_not_verify_child_launch(self):
         project_dir = Path('/cell/project')
         deadline = 900
         prompt = build_prompt('patch', 'fabric', project_dir, deadline)
         script = json.loads(prompt.partition('fabric_exec code = ')[2].splitlines()[0])
-        fabricated = {'children': [
-            {'key': key, 'startedAt': 100, 'endedAt': 300,
-             'result': {'runnerSessionId': key, 'usage': {'input': 10, 'output': 2}}}
-            for key in ('a', 'b', 'c')
-        ]}
         events = [
-            {'type': 'tool_execution_start', 'toolName': 'fabric_exec',
-             'args': {'code': f'/* {script} */'}},
-            {'type': 'tool_execution_end', 'toolName': 'fabric_exec',
-             'result': {'text': json.dumps(fabricated)}},
+            {'type': 'tool_execution_start', 'toolCallId': 'fabric-comment',
+             'toolName': 'fabric_exec', 'args': {'code': f'/* {script} */'}},
+            {'type': 'tool_execution_end', 'toolCallId': 'fabric-comment',
+             'toolName': 'fabric_exec', 'result': {'content': []}, 'isError': False},
         ]
-
         self.assertFalse(child_launch_evidence(
             'fabric', events, 'patch', project_dir, deadline)['verified'])
-        children = extract_children(events, arm='fabric')
-        self.assertEqual(children, [])
-        self.assertFalse(overlap_summary(children)['evidenced'])
 
     def test_interrupted_process_group_uses_term_then_kill(self):
         class FakeProcess:
@@ -393,15 +639,21 @@ class ReportingChecks(unittest.TestCase):
         self.assertEqual(usage['total_tokens'], 18)
         self.assertFalse(parse_events([{'type': 'agent_settled'}], 0)['usage']['known'])
 
-    def test_duplicate_child_result_is_counted_once(self):
-        event = {'children': [{
+    def test_subagents_require_native_session_telemetry(self):
+        result = {'children': [{
             'key': 'worker-a', 'startedAt': 100, 'endedAt': 300,
             'result': {'usage': {'input': 10, 'output': 2}},
         }]}
-        children = extract_children([event, event], arm='subagents')
-        self.assertEqual(len(children), 1)
-        self.assertEqual(children[0]['usage']['total_tokens'], 12)
-        self.assertEqual(extract_children([event], arm='stock'), [])
+        events = [
+            {'type': 'tool_execution_start', 'toolCallId': 'workflow-1',
+             'toolName': 'subagent', 'args': {'workflowScript': 'runs.all(children)'}},
+            {'type': 'tool_execution_end', 'toolCallId': 'workflow-1',
+             'toolName': 'subagent',
+             'result': {'content': [{'type': 'text', 'text': json.dumps(result)}]},
+             'isError': False},
+        ]
+        self.assertEqual(extract_children(events, arm='subagents'), [])
+        self.assertEqual(extract_children(events, arm='stock'), [])
 
     def test_report_keeps_failures_and_pairs_only_correct_cells(self):
         def cell(arm, repetition, status, elapsed):
@@ -432,6 +684,43 @@ class ReportingChecks(unittest.TestCase):
         self.assertEqual(triage['paired_speedup']['subagents']['pairs'], 1)
         self.assertEqual(triage['paired_speedup']['subagents']['median_speedup'], 2)
         self.assertEqual(len(result['failed_cells']), 1)
+
+    def test_markdown_report_preserves_metrics_and_unknowns(self):
+        def cell(arm, repetition, status, elapsed, usage, overlap=None, failures=None):
+            return {
+                'case': 'triage', 'arm': arm, 'repetition': repetition,
+                'status': status, 'correct': status == 'passed', 'elapsed_ms': elapsed,
+                'usage': usage, 'overlap': overlap, 'failures': failures or [],
+            }
+
+        known = {
+            'known': True, 'input_tokens': 80, 'output_tokens': 20,
+            'total_tokens': 100, 'cost_usd': 0.01,
+        }
+        unknown = {
+            'known': False, 'input_tokens': None, 'output_tokens': None,
+            'total_tokens': None, 'cost_usd': None,
+        }
+        result = build_report([
+            cell('stock', 1, 'passed', 1000, known),
+            cell('stock', 2, 'passed', 900, known),
+            cell('subagents', 1, 'passed', 500, known,
+                 {'evidenced': True, 'interval_count': 3, 'max_concurrency': 3}),
+            cell('subagents', 2, 'failed', 400, unknown,
+                 {'evidenced': False, 'interval_count': None, 'max_concurrency': None},
+                 ['bad | <script>']),
+        ], repetitions=2, cases=['triage'], arms=['stock', 'subagents', 'fabric'])
+        markdown = render_markdown(result)
+
+        self.assertIn('4/6 recorded; 3 passed; 1 failed; 2 not run', markdown)
+        self.assertIn('1/2 | 1 | 0 | 50.0% | 500.0 ms', markdown)
+        self.assertIn('2.00× (n=1)', markdown)
+        self.assertIn('Unknown (1/2 cells known)', markdown)
+        self.assertIn('1/2 verified; peak 3; 1 unknown', markdown)
+        self.assertIn('| 2 | subagents | failed | no | 400.0 ms | Unknown |', markdown)
+        self.assertIn(r'bad \| &lt;script&gt;', markdown)
+        self.assertNotIn('<script>', markdown)
+        self.assertIn('| fabric | 0/2 | 0 | 2 |', markdown)
 
     def test_missing_usage_is_unknown_not_zero(self):
         result = build_report([{
@@ -474,6 +763,21 @@ class ReportingChecks(unittest.TestCase):
             manifest = json.loads((Path(report['run_dir']) / 'run.json').read_text())
             self.assertEqual(manifest['repetitions'], 1)
             self.assertEqual(manifest['repetition_ids'], [3])
+            markdown_path = Path(report['markdown_report'])
+            self.assertEqual(markdown_path, Path(report['run_dir']) / 'report.md')
+            self.assertIn('100.0 ms', markdown_path.read_text())
+
+            markdown_path.unlink()
+            regenerated_output = io.StringIO()
+            with contextlib.redirect_stdout(regenerated_output):
+                regenerate_status = main([
+                    '--cache-root', str(cache_root), 'report', str(Path(report['run_dir'])),
+                ])
+            self.assertEqual(regenerate_status, 0)
+            regenerated = json.loads(regenerated_output.getvalue())
+            self.assertTrue(markdown_path.exists())
+            self.assertEqual(regenerated['markdown_report'], str(markdown_path))
+            self.assertIn('100.0 ms', markdown_path.read_text())
 
     def test_write_json_replaces_symlink_without_modifying_target(self):
         with tempfile.TemporaryDirectory() as tmp:

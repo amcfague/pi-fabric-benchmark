@@ -6,7 +6,7 @@ Read the three modules without changing them. For each named function, report it
 - `billing.subtotal_cents(1250, 4)`
 - `shipping.shipping_fee_cents(5000)`
 
-Then combine the intended behavior for an order of 4 units at 1250 cents each, with 11 units in stock and 4 reserved. The free-shipping threshold is 5000 cents. State whether the order can be fulfilled, remaining inventory, subtotal, and shipping charge.
+Then combine the intended behavior for an order of 4 units at 1250 cents each, with 11 units in stock and 4 reserved. `conclusion.available_units` means stock minus reservations before fulfillment; do not subtract the order quantity again. The free-shipping threshold is 5000 cents. State whether the order can be fulfilled, available inventory before fulfillment, subtotal, and shipping charge.
 
 Return only a JSON object with this shape. The zeros and `false` are placeholders; calculate every value. Do not add prose or keys:
 

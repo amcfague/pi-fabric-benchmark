@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import re
@@ -29,6 +30,10 @@ CHILD_CAP = 3
 DEFAULT_DEADLINE = 900
 CORE_TOOLS = ("read", "grep", "find", "ls", "bash", "edit", "write")
 ARMS = ("stock", "subagents", "fabric")
+ARM_EXTENSION_TOOLS = {
+    "subagents": ("subagents_enable", "subagent"),
+    "fabric": ("fabric_exec",),
+}
 CASES = ("triage", "patch")
 PINS = {
     "subagents": {
@@ -39,6 +44,10 @@ PINS = {
         "name": "pi-fabric", "version": "0.100.0",
         "integrity": "sha512-tW1DBe8cZYN91yezHHud5R3nLCV8LU2/1rS69f9u0LnsuuDXBVpxbEa06o2sbiJuANMxIJ1PGf+2wGXdGWqAmg==",
     },
+}
+SUBAGENT_RUNTIME_PIN = {
+    "name": "@earendil-works/pi-coding-agent", "version": "0.87.1",
+    "integrity": "sha512-m8ArJUtVcQMSe1lLE/Ei7vX/JV7O39sWmWBsXV2NOU70F0qCp8GubA24pT3LnwTmM6LL2xV80/h6sQg85n69ew==",
 }
 
 
@@ -121,6 +130,32 @@ def inspect_package(arm: str, cache_root: Path) -> dict[str, Any]:
     }
 
 
+def inspect_subagents_runtime(cache_root: Path) -> dict[str, Any]:
+    pin = SUBAGENT_RUNTIME_PIN
+    prefix = cache_root / "packages" / "subagents"
+    root = prefix / "node_modules" / "@earendil-works" / "pi-coding-agent"
+    metadata_path = root / "package.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"pinned Pi host runtime is not installed: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text())
+    if metadata.get("name") != pin["name"] or metadata.get("version") != pin["version"]:
+        raise ValueError(f"wrong Pi host runtime installed at {root}; expected {pin['name']}@{pin['version']}")
+    lock_path = prefix / "package-lock.json"
+    lock_integrity = None
+    if lock_path.is_file():
+        lock = json.loads(lock_path.read_text())
+        package_lock = lock.get("packages", {}).get("node_modules/@earendil-works/pi-coding-agent", {})
+        lock_integrity = package_lock.get("integrity")
+        if lock_integrity and lock_integrity != pin["integrity"]:
+            raise ValueError("npm lock integrity does not match the pinned Pi host runtime")
+    return {
+        "name": pin["name"], "version": pin["version"],
+        "integrity": pin["integrity"], "lock_integrity": lock_integrity,
+        "integrity_verified": lock_integrity == pin["integrity"],
+        "sha256": tree_sha256(root), "root": str(root.resolve()),
+    }
+
+
 def install_packages(cache_root: Path) -> dict[str, Any]:
     private_dir(cache_root)
     installed = {}
@@ -129,18 +164,31 @@ def install_packages(cache_root: Path) -> dict[str, Any]:
         actual = npm_integrity(spec)
         if actual != pin["integrity"]:
             raise RuntimeError(f"registry integrity changed for {spec}; expected pinned tarball")
+        specs = [spec]
+        if arm == "subagents":
+            runtime = SUBAGENT_RUNTIME_PIN
+            runtime_spec = f"{runtime['name']}@{runtime['version']}"
+            if npm_integrity(runtime_spec) != runtime["integrity"]:
+                raise RuntimeError(f"registry integrity changed for {runtime_spec}; expected pinned tarball")
+            specs.append(runtime_spec)
         prefix = private_dir(cache_root / "packages" / arm)
         result = subprocess.run(
             ["npm", "install", "--prefix", str(prefix), "--save-exact", "--ignore-scripts",
-             "--no-audit", "--no-fund", spec],
+             "--no-audit", "--no-fund", *specs],
             capture_output=True, text=True, timeout=600,
         )
         if result.returncode:
-            raise RuntimeError(f"npm install failed for {spec}: {result.stderr.strip()}")
+            raise RuntimeError(f"npm install failed for {', '.join(specs)}: {result.stderr.strip()}")
         info = inspect_package(arm, cache_root)
         if not info["integrity_verified"]:
             raise RuntimeError(f"npm lock did not verify the tarball integrity for {spec}")
         info["registry_integrity_verified"] = True
+        if arm == "subagents":
+            host_runtime = inspect_subagents_runtime(cache_root)
+            if not host_runtime["integrity_verified"]:
+                raise RuntimeError(f"npm lock did not verify the tarball integrity for {runtime_spec}")
+            host_runtime["registry_integrity_verified"] = True
+            info["host_runtime"] = host_runtime
         installed[arm] = info
     _write_json(cache_root / "package-manifest.json", {"version": 1, "packages": installed})
     return installed
@@ -165,7 +213,7 @@ def build_command(
     command = [
         pi_binary, "--mode", "json", "--provider", PROVIDER, "--model", MODEL,
         "--thinking", THINKING, "--session-dir", str(session_dir),
-        "--tools", ",".join(CORE_TOOLS), "--no-skills",
+        "--tools", ",".join(CORE_TOOLS + ARM_EXTENSION_TOOLS.get(arm, ())), "--no-skills",
         "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve",
     ]
     if arm == "stock":
@@ -181,13 +229,13 @@ def build_command(
 
 def build_environment(
     cell_dir: Path, source: dict[str, str] | None = None,
-    pi_binary: str = PI_BINARY,
+    pi_binary: str = PI_BINARY, subagents_runtime_root: str | Path | None = None,
 ) -> dict[str, str]:
     source = os.environ if source is None else source
     allowed = (
         "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "LC_CTYPE",
         "TERM", "TZ", "http_proxy", "https_proxy", "no_proxy", "HTTP_PROXY",
-        "HTTPS_PROXY", "NO_PROXY", "OPENAI_API_KEY", "SSL_CERT_FILE", "SSL_CERT_DIR",
+        "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
         "NODE_EXTRA_CA_CERTS",
     )
     env = {key: source[key] for key in allowed if source.get(key)}
@@ -197,6 +245,11 @@ def build_environment(
     env["PI_CODING_AGENT_DIR"] = str(agent_dir)
     env["PI_SUBAGENT_PI_BINARY"] = pi_binary
     env["PI_FABRIC_PI_BINARY"] = pi_binary
+    if subagents_runtime_root is not None:
+        _write_json(agent_dir / "settings.json", {
+            "subagents": {"agentOverrides": {"worker": {"thinking": THINKING}}},
+        })
+        env["PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT"] = str(Path(subagents_runtime_root).resolve())
     validate_pi_binary(pi_binary, env)
     return env
 
@@ -231,45 +284,9 @@ def _child_tasks(case: str, project_dir: Path) -> list[dict[str, str]]:
     return tasks
 
 
-def build_prompt(case: str, arm: str, project_dir: Path, deadline_seconds: int = DEFAULT_DEADLINE) -> str:
-    if case not in CASES or arm not in ARMS:
-        raise ValueError("unknown case or arm")
-    case_text = (ROOT / "cases" / f"{case}.md").read_text()
-    base = f"{case_text}\n\nThe writable fixture is {project_dir}. Use no files outside it."
-    if arm == "stock":
-        return base
-    tasks = _child_tasks(case, project_dir)
-    child_timeout = deadline_seconds * 1000
-    if arm == "subagents":
-        children = [
-            {
-                "key": task["key"], "agent": "worker", "task": task["task"],
-                "model": f"{PROVIDER}/{MODEL}:{THINKING}",
-                "tools": ",".join(CORE_TOOLS), "extensions": [], "skills": [],
-                "context": "fresh", "cwd": str(project_dir), "worktree": False,
-                "timeoutMs": child_timeout,
-            }
-            for task in tasks
-        ]
-        script = (
-            "const children = " + json.dumps(children, separators=(",", ":")) + ";\n"
-            "const results = await runs.all(children);\nreturn { children: results };"
-        )
-        return (
-            base + f"\n\nDelegate exactly these three independent tasks in parallel; child cap is {CHILD_CAP}. "
-            "Use the pi-subagents workflow, never another runtime. If only subagents_enable is "
-            "available, call it first, then make exactly one top-level subagent workflow call with "
-            "this script and async:true; wait for its completion before answering. The workflow "
-            "must use runs.all once. Each child has extensions: [] and skills: []; do not change "
-            "the child model, tools, cwd, or deadline. Return the three child results to the parent.\n\n"
-            "workflowScript = " + json.dumps(script) + "\n"
-            f"Outer request: cwd={json.dumps(str(project_dir))}, async=true, "
-            f"timeoutMs={child_timeout}, mission=false."
-        )
-    specs = [
-        {"key": task["key"], "task": task["task"]} for task in tasks
-    ]
-    script = (
+def _fabric_script(tasks: list[dict[str, str]], project_dir: Path, child_timeout: int) -> str:
+    specs = [{"key": task["key"], "task": task["task"]} for task in tasks]
+    return (
         "const specs = " + json.dumps(specs, separators=(",", ":")) + ";\n"
         "const children = await Promise.all(specs.map(async (spec) => {\n"
         "  const startedAt = Date.now();\n"
@@ -284,6 +301,47 @@ def build_prompt(case: str, arm: str, project_dir: Path, deadline_seconds: int =
         "  }};\n}));\n"
         "console.log(JSON.stringify({ children }));\nreturn { children };"
     )
+
+
+def build_prompt(case: str, arm: str, project_dir: Path, deadline_seconds: int = DEFAULT_DEADLINE) -> str:
+    if case not in CASES or arm not in ARMS:
+        raise ValueError("unknown case or arm")
+    case_text = (ROOT / "cases" / f"{case}.md").read_text()
+    base = f"{case_text}\n\nThe writable fixture is {project_dir}. Use no files outside it."
+    if arm == "stock":
+        return base
+    tasks = _child_tasks(case, project_dir)
+    child_timeout = deadline_seconds * 1000
+    if arm == "subagents":
+        children = [
+            {
+                "key": task["key"], "agent": "worker", "task": task["task"],
+                "async": False, "tools": ",".join(CORE_TOOLS), "extensions": [], "skills": [],
+                "acceptance": {
+                    "level": "none",
+                    "reason": "Read-only benchmark output is checked by the parent grader",
+                },
+                "context": "fresh", "cwd": str(project_dir), "worktree": False,
+                "timeoutMs": child_timeout,
+            }
+            for task in tasks
+        ]
+        script = (
+            "const children = " + json.dumps(children, separators=(",", ":")) + ";\n"
+            "const results = await runs.all(children);\nconsole.log(JSON.stringify({ children: results }));\nreturn { children: results };"
+        )
+        return (
+            base + f"\n\nDelegate exactly these three independent tasks in parallel; child cap is {CHILD_CAP}. "
+            "Use the pi-subagents workflow, never another runtime. Call subagents_enable first, "
+            "then call subagent({action:\"list\",capabilities:true}) and make exactly one top-level workflow call with this script and async:false. "
+            "Wait for the workflow tool to finish. Synthesize from its three returned child records; if inline output is empty, read only that child's returned sessionFile for its final assistant response. Never read fixture source in the parent. "
+            "The workflow must use runs.all once. Each child runs foreground with async:false and inherits the parent provider and model; private cell worker settings match the parent thinking level. Pass no per-run model or thinking override. "
+            "Each child sets acceptance to none because the parent grader checks these read-only results. Children have extensions: [] and skills: []; do not change their tools, cwd, or deadline.\n\n"
+            "workflowScript = " + json.dumps(script) + "\n"
+            f"Outer request: cwd={json.dumps(str(project_dir))}, async=false, "
+            f"timeoutMs={child_timeout}, mission=false."
+        )
+    script = _fabric_script(tasks, project_dir, child_timeout)
     return (
         base + f"\n\nDelegate exactly these three independent tasks concurrently; child cap is {CHILD_CAP}. "
         "Call the loaded fabric_exec tool once with the following TypeScript. Do not perform the "
@@ -362,6 +420,8 @@ def read_events(path: Path) -> tuple[list[dict[str, Any]], int]:
     if not path.is_file():
         return events, 0
     for line in path.read_text(errors="replace").splitlines():
+        if line == "[mcporter] stderr from headroom":
+            continue
         try:
             value = json.loads(line)
             if isinstance(value, dict):
@@ -458,11 +518,18 @@ def _walk(value: Any):
     elif isinstance(value, list):
         for child in value:
             yield from _walk(child)
-    elif isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+    elif isinstance(value, str):
+        text = value.lstrip()
+        if not text.startswith(("{", "[")):
+            marker = text.find("Return:")
+            if marker < 0:
+                return
+            text = text[marker + len("Return:"):].lstrip()
         try:
-            yield from _walk(json.loads(value))
+            parsed, _ = json.JSONDecoder().raw_decode(text)
         except json.JSONDecodeError:
             return
+        yield from _walk(parsed)
 
 
 def _time_value(record: dict[str, Any], *keys: str) -> int | float | None:
@@ -473,11 +540,186 @@ def _time_value(record: dict[str, Any], *keys: str) -> int | float | None:
     return None
 
 
-def extract_children(events: list[dict[str, Any]], arm: str) -> list[dict[str, Any]]:
-    if arm != "subagents":
+def _completed_tool_calls(events: list[dict[str, Any]], name: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    starts: dict[str, dict[str, Any]] = {}
+    ends: dict[str, dict[str, Any]] = {}
+    for event in events:
+        kind = event.get("type", event.get("event"))
+        if event.get("toolName") != name:
+            continue
+        call_id = event.get("toolCallId")
+        if not isinstance(call_id, str):
+            continue
+        if kind == "tool_execution_start":
+            starts[call_id] = event
+        elif kind == "tool_execution_end":
+            ends[call_id] = event
+    return [(start, ends[call_id]) for call_id, start in starts.items() if call_id in ends]
+
+
+def _timestamp_ms(value: Any) -> int | float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000
+    except (ValueError, OverflowError):
+        return None
+
+
+def _trusted_session_file(value: Any, session_dir: Path) -> Path | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        root = session_dir.resolve()
+        path = Path(value).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    return path if path.is_file() and path.is_relative_to(root) else None
+
+
+def _session_result(path: Path) -> dict[str, Any] | None:
+    started_at = ended_at = None
+    model = thinking = None
+    output = ""
+    try:
+        with path.open(encoding="utf-8") as session:
+            for line in session:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                timestamp = _timestamp_ms(event.get("timestamp"))
+                if event.get("type") == "model_change":
+                    provider, model_id = event.get("provider"), event.get("modelId")
+                    if isinstance(provider, str) and isinstance(model_id, str):
+                        model = f"{provider}/{model_id}"
+                elif event.get("type") == "thinking_level_change":
+                    thinking = event.get("thinkingLevel")
+                if event.get("type") == "session" and started_at is None:
+                    started_at = timestamp
+                message = event.get("message")
+                if (event.get("type") != "message" or not isinstance(message, dict)
+                        or message.get("role") != "assistant"
+                        or message.get("stopReason") not in ("stop", "end_turn", "endTurn")):
+                    continue
+                if timestamp is None:
+                    continue
+                ended_at = timestamp
+                content = message.get("content", [])
+                if isinstance(content, str):
+                    output = content
+                elif isinstance(content, list):
+                    output = "".join(
+                        part.get("text", "") for part in content
+                        if isinstance(part, dict) and part.get("type") == "text"
+                    )
+                else:
+                    output = ""
+    except OSError:
+        return None
+    if started_at is None or ended_at is None or ended_at <= started_at or not output.strip():
+        return None
+    return {"startedAt": started_at, "endedAt": ended_at, "output": output, "model": model, "thinking": thinking}
+
+
+def _returned_session_files(events: list[dict[str, Any]], session_dir: Path) -> set[Path]:
+    files = set()
+    for start, end in _completed_tool_calls(events, "subagent"):
+        if (not isinstance(start.get("args"), dict)
+                or not isinstance(start["args"].get("workflowScript"), str)
+                or end.get("isError") is not False):
+            continue
+        result = end.get("result")
+        details = result.get("details", {}) if isinstance(result, dict) else {}
+        if not isinstance(details, dict):
+            continue
+        for record in details.get("results", []):
+            if not isinstance(record, dict):
+                continue
+            path = _trusted_session_file(record.get("sessionFile"), session_dir)
+            if path is not None:
+                files.add(path)
+    return files
+
+
+def _subagents_child_records(result: Any, session_dir: Path) -> list[dict[str, Any]]:
+    if not isinstance(result, dict):
+        return []
+    details = result.get("details")
+    if not isinstance(details, dict):
+        return []
+    workflow = details.get("workflow")
+    workflow_value = workflow.get("value") if isinstance(workflow, dict) else None
+    children = workflow_value.get("children") if isinstance(workflow_value, dict) else None
+    result_rows = details.get("results")
+    if not isinstance(children, list) or not isinstance(result_rows, list):
+        return []
+    rows_by_key = {
+        row.get("workflowKey"): row for row in result_rows
+        if isinstance(row, dict) and isinstance(row.get("workflowKey"), str)
+    }
+    records = []
+    for child in children:
+        if not isinstance(child, dict) or child.get("ok") is not True:
+            continue
+        key = child.get("key")
+        row = rows_by_key.get(key)
+        if (not isinstance(key, str) or not isinstance(row, dict)
+                or row.get("exitCode") not in (None, 0) or row.get("success") is False):
+            continue
+        acceptance = row.get("acceptance")
+        if isinstance(acceptance, dict) and acceptance.get("status") == "rejected":
+            continue
+        path = _trusted_session_file(row.get("sessionFile"), session_dir)
+        session = _session_result(path) if path is not None else None
+        if session is None:
+            continue
+        run_id = child.get("runId")
+        identifier = str(run_id if isinstance(run_id, (str, int)) else key)
+        item = {
+            "id": identifier, "key": key,
+            "agent": row.get("agent") or child.get("agent"),
+            "runId": run_id, "state": "completed", "status": "completed",
+            **session,
+        }
+        if isinstance(row.get("model"), str):
+            item["extensionModel"] = row["model"]
+        if isinstance(row.get("thinking"), str):
+            item["extensionThinking"] = row["thinking"]
+        usage = _usage_record(row.get("usage"))
+        if usage is not None:
+            item["usage"] = usage
+        records.append(item)
+    return records
+
+
+def extract_children(
+    events: list[dict[str, Any]], arm: str, session_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    if arm not in ("subagents", "fabric"):
         return []
     found: dict[str, dict[str, Any]] = {}
-    for event in events:
+    if arm == "subagents":
+        source_events = [
+            end.get("result") for start, end in _completed_tool_calls(events, "subagent")
+            if isinstance(start.get("args"), dict)
+            and isinstance(start["args"].get("workflowScript"), str)
+            and end.get("isError") is False
+        ]
+        if session_dir is None:
+            return []
+        for result in source_events:
+            for record in _subagents_child_records(result, session_dir):
+                found[record["id"]] = record
+        return list(found.values())
+    else:
+        source_events = [
+            end.get("result") for _, end in _completed_tool_calls(events, "fabric_exec")
+            if end.get("isError") is False
+        ]
+    for event in source_events:
         for record in _walk(event):
             identifier = record.get("runId", record.get("runnerSessionId", record.get("childId", record.get("key"))))
             start = _time_value(record, "startedAt", "started_at", "startTime")
@@ -555,20 +797,31 @@ def child_launch_evidence(
     arm: str, events: list[dict[str, Any]], case: str, project_dir: Path, deadline_seconds: int,
 ) -> dict[str, Any]:
     calls = _tool_calls(events)
-    if arm == "fabric":
-        return {
-            "verified": False, "tool_calls": [name for name, _ in calls],
-            "reason": "runner-generated Fabric child telemetry is unavailable",
-        }
-    expected_cwd = re.escape(json.dumps(str(project_dir)))
     expected_timeout = deadline_seconds * 1000
+    if arm == "fabric":
+        starts = [event for event in events if event.get("type", event.get("event")) == "tool_execution_start" and event.get("toolName") == "fabric_exec"]
+        ends = [event for event in events if event.get("type", event.get("event")) == "tool_execution_end" and event.get("toolName") == "fabric_exec"]
+        pairs = _completed_tool_calls(events, "fabric_exec")
+        args = starts[0].get("args") if len(starts) == 1 else None
+        code = args.get("code") if isinstance(args, dict) else None
+        expected_code = _fabric_script(_child_tasks(case, project_dir), project_dir, expected_timeout)
+        valid = (
+            len(starts) == len(ends) == len(pairs) == 1
+            and ends[0].get("isError") is False
+            and isinstance(code, str)
+            and re.sub(r"\s+", "", code) == re.sub(r"\s+", "", expected_code)
+            and all(name == "fabric_exec" for name, _ in calls)
+        )
+        reason = "one successful fabric_exec call ran three isolated agents in parallel" if valid else "Fabric child launch is unverified"
+        return {"verified": valid, "tool_calls": [name for name, _ in calls], "reason": reason}
+    expected_cwd = re.escape(json.dumps(str(project_dir)))
     expected_tasks = _child_tasks(case, project_dir)
     if arm == "subagents":
-        scripts = [" ".join(_text_values(args)) for name, args in calls if name == "subagent"]
+        scripts = [" ".join(_text_values(args)) for name, args in calls if name == "subagent" and isinstance(args, dict) and isinstance(args.get("workflowScript"), str)]
         valid = False
         if len(scripts) == 1:
             script = scripts[0]
-            model = re.escape(json.dumps(f"{PROVIDER}/{MODEL}:{THINKING}"))
+
             child_count = lambda pattern: len(re.findall(pattern, script)) == CHILD_CAP
             valid = (
                 script.count("runs.all") == 1 and script.count("runs.run") == 0
@@ -577,14 +830,54 @@ def child_launch_evidence(
                         for task in expected_tasks)
                 and child_count(r'"extensions"\s*:\s*\[\s*\]')
                 and child_count(r'"skills"\s*:\s*\[\s*\]')
-                and child_count(r'"model"\s*:\s*' + model)
+                and child_count(r'"async"\s*:\s*false')
+                and child_count(r'"acceptance"\s*:\s*\{\s*"level"\s*:\s*"none"')
+                and not re.search(r'"(?:model|thinking)"\s*:', script)
                 and child_count(r'"tools"\s*:\s*' + re.escape(json.dumps(",".join(CORE_TOOLS))))
                 and child_count(r'"cwd"\s*:\s*' + expected_cwd)
                 and child_count(r'"timeoutMs"\s*:\s*' + str(expected_timeout))
                 and child_count(r'"context"\s*:\s*"fresh"')
                 and child_count(r'"worktree"\s*:\s*false')
             )
-        reason = "three isolated subagent launches match model, tools, cwd, and deadline" if valid else "subagent child loadout is unverified"
+        workflow_starts = [
+            event for event in events
+            if event.get("type", event.get("event")) == "tool_execution_start"
+            and event.get("toolName") == "subagent"
+            and isinstance(event.get("args"), dict)
+            and isinstance(event["args"].get("workflowScript"), str)
+        ]
+        workflow_pairs = [
+            (start, end) for start, end in _completed_tool_calls(events, "subagent")
+            if isinstance(start.get("args"), dict)
+            and isinstance(start["args"].get("workflowScript"), str)
+        ]
+        workflow_args = workflow_starts[0].get("args") if len(workflow_starts) == 1 else None
+        valid = valid and len(workflow_starts) == len(workflow_pairs) == 1
+        valid = valid and workflow_pairs[0][1].get("isError") is False
+        valid = valid and isinstance(workflow_args, dict) and workflow_args.get("async") is False
+        valid = valid and workflow_args.get("cwd") == str(project_dir)
+        valid = valid and workflow_args.get("timeoutMs") == expected_timeout
+        valid = valid and workflow_args.get("mission") is False
+        enable_calls = [args for name, args in calls if name == "subagents_enable"]
+        list_calls = [
+            args for name, args in calls if name == "subagent"
+            and isinstance(args, dict) and not isinstance(args.get("workflowScript"), str)
+        ]
+        valid = valid and len(enable_calls) == 1
+        valid = valid and len(list_calls) == 1 and list_calls[0].get("action") == "list"
+        session_dir = project_dir.parent / "session"
+        returned_sessions = _returned_session_files(events, session_dir)
+        unexpected_calls = []
+        for name, args in calls:
+            if name in ("subagents_enable", "subagent"):
+                continue
+            if name == "read" and isinstance(args, dict):
+                path = _trusted_session_file(args.get("path"), session_dir)
+                if path is not None and path in returned_sessions:
+                    continue
+            unexpected_calls.append(name)
+        valid = valid and not unexpected_calls
+        reason = "one successful foreground subagent workflow ran three isolated agents in parallel" if valid else "subagent child launch or result collection is unverified"
         return {"verified": valid, "tool_calls": [name for name, _ in calls], "reason": reason}
     return {"verified": True, "tool_calls": [name for name, _ in calls], "reason": "stock Pi has no delegated children"}
 
@@ -626,8 +919,11 @@ def preflight(cache_root: Path, pi_binary: str = PI_BINARY, source_env: dict[str
     except Exception as error:
         pi_version = None
         errors.append(f"Pi wrapper preflight: {error}")
-    if not source_env.get("OPENAI_API_KEY"):
-        errors.append("OPENAI_API_KEY is missing")
+    if pi_version and pi_version.splitlines()[-1].strip() != SUBAGENT_RUNTIME_PIN["version"]:
+        errors.append(
+            f"Pi wrapper version does not match the pinned pi-subagents host runtime "
+            f"{SUBAGENT_RUNTIME_PIN['version']}"
+        )
     packages = {}
     manifest_path = cache_root / "package-manifest.json"
     try:
@@ -649,19 +945,33 @@ def preflight(cache_root: Path, pi_binary: str = PI_BINARY, source_env: dict[str
                 raise ValueError("installed package tree differs from the recorded hash; rerun install")
             if saved.get("integrity") != PINS[arm]["integrity"]:
                 raise ValueError("package manifest does not match the pinned tarball")
+            if arm == "subagents":
+                runtime = SUBAGENT_RUNTIME_PIN
+                runtime_spec = f"{runtime['name']}@{runtime['version']}"
+                if npm_integrity(runtime_spec) != runtime["integrity"]:
+                    raise ValueError("registry integrity differs from the pinned Pi host runtime")
+                host_runtime = inspect_subagents_runtime(cache_root)
+                host_runtime["registry_integrity_verified"] = True
+                if not host_runtime["integrity_verified"]:
+                    raise ValueError("local npm lock does not verify the pinned Pi host runtime")
+                saved_runtime = saved.get("host_runtime", {})
+                if (saved_runtime.get("sha256") != host_runtime["sha256"]
+                        or saved_runtime.get("version") != runtime["version"]
+                        or saved_runtime.get("integrity") != runtime["integrity"]):
+                    raise ValueError("Pi host runtime differs from the recorded pin; rerun install")
+                info["host_runtime"] = host_runtime
             packages[arm] = info
         except Exception as error:
             errors.append(f"{arm} package preflight: {error}")
     return {
         "passed": not errors, "errors": errors, "pi_binary": pi_binary,
         "pi_version": pi_version, "provider": PROVIDER, "model": MODEL,
-        "thinking": THINKING, "credential_present": bool(source_env.get("OPENAI_API_KEY")),
-        "package_info": packages,
+        "thinking": THINKING, "package_info": packages,
         "model_connectivity": "verified by first live cell; no separate billable probe",
     }
 
 
-def _write_json(path: Path, value: Any) -> None:
+def _write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = None
     try:
@@ -669,7 +979,7 @@ def _write_json(path: Path, value: Any) -> None:
             "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False,
         ) as output:
             temporary_path = Path(output.name)
-            output.write(json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
+            output.write(content)
         os.replace(temporary_path, path)
     finally:
         if temporary_path is not None:
@@ -677,6 +987,16 @@ def _write_json(path: Path, value: Any) -> None:
                 temporary_path.unlink()
             except FileNotFoundError:
                 pass
+
+
+def _write_json(path: Path, value: Any) -> None:
+    _write_text(path, json.dumps(value, indent=2, sort_keys=True, default=str) + "\n")
+
+
+def _write_report_files(run_dir: Path, report: dict[str, Any]) -> None:
+    report["markdown_report"] = str(run_dir.resolve() / "report.md")
+    _write_text(run_dir / "report.md", render_markdown(report))
+    _write_json(run_dir / "report.json", report)
 
 
 def _seed_hash() -> str:
@@ -693,22 +1013,32 @@ def run_cell(
     project = cell_dir / "project"
     shutil.copytree(ROOT / "fixtures" / "project", project)
     session_dir = private_dir(cell_dir / "session")
-    env = build_environment(cell_dir, source_env, pi_binary)
+    subagents_runtime_root = (
+        packages.get("subagents", {}).get("host_runtime", {}).get("root")
+        if arm == "subagents" else None
+    )
+    env = build_environment(
+        cell_dir, source_env, pi_binary, subagents_runtime_root=subagents_runtime_root,
+    )
     package_paths = {key: value["entry"] for key, value in packages.items()}
     prompt = build_prompt(case, arm, project, deadline_seconds)
     command = build_command(arm, prompt, session_dir, package_paths, pi_binary)
     extension_args = [command[i + 1] for i, arg in enumerate(command[:-1]) if arg == "-e"]
+    selected_tools = command[command.index("--tools") + 1].split(",")
+    expected_tools = list(CORE_TOOLS + ARM_EXTENSION_TOOLS.get(arm, ()))
     if arm == "stock":
-        parent_loadout_verified = "--no-extensions" in command and not extension_args
+        parent_loadout_verified = (
+            selected_tools == expected_tools and "--no-extensions" in command and not extension_args
+        )
     else:
         parent_loadout_verified = (
-            "--no-extensions" not in command and extension_args == [package_paths[arm]]
+            selected_tools == expected_tools and "--no-extensions" not in command
+            and extension_args == [package_paths[arm]]
         )
     (cell_dir / "prompt.txt").write_text(prompt)
     _write_json(cell_dir / "argv.json", command)
     environment_info = {
         "agent_dir": env["PI_CODING_AGENT_DIR"], "path_prefix": str(Path(pi_binary).parent),
-        "credential_present": bool(env.get("OPENAI_API_KEY")),
         "environment_keys": sorted(key for key in env if key.endswith("_API_KEY") or "proxy" in key.lower()),
         "child_binary": pi_binary,
     }
@@ -718,9 +1048,15 @@ def run_cell(
     )
     events, malformed = read_events(cell_dir / "events.jsonl")
     agent = parse_events(events, result["exit_code"])
-    children = extract_children(events, arm=arm)
-    overlap = overlap_summary(children)
     launches = child_launch_evidence(arm, events, case, project, deadline_seconds)
+    children = extract_children(events, arm=arm, session_dir=session_dir) if launches["verified"] else []
+    child_runtime_matches_parent = arm != "subagents" or (
+        len(children) == CHILD_CAP and all(
+            child.get("model") == f"{PROVIDER}/{MODEL}" and child.get("thinking") == THINKING
+            for child in children
+        )
+    )
+    overlap = overlap_summary(children)
     child_usage_records = [item["usage"] for item in children if isinstance(item.get("usage"), dict)]
     child_usage = _sum_usage(child_usage_records)
     if len(child_usage_records) != len(children):
@@ -765,6 +1101,8 @@ def run_cell(
             failures.append(f"expected {CHILD_CAP} child records, found {len(children)}")
         if not overlap["evidenced"]:
             failures.append("timestamped overlapping child intervals are unverified")
+        if not child_runtime_matches_parent:
+            failures.append("subagent child model/thinking did not match the parent")
         if not child_usage["known"]:
             failures.append("child token usage is unknown")
     if malformed:
@@ -780,7 +1118,7 @@ def run_cell(
         "grader": grader, "seed_sha256": _seed_hash(),
         "parent_extensions": [] if arm == "stock" else [packages[arm]["entry"]],
         "parent_loadout_verified": parent_loadout_verified,
-        "child_loadout": launches,
+        "child_loadout": launches, "child_runtime_matches_parent": child_runtime_matches_parent,
         "packages": {key: value for key, value in packages.items() if key == arm},
         "children": children, "overlap": overlap, "usage": usage,
         "environment": environment_info,
@@ -927,6 +1265,128 @@ def build_report(
     }
 
 
+def render_markdown(report: dict[str, Any]) -> str:
+    def text(value: Any) -> str:
+        return (html.escape(str(value), quote=False).replace("\\", "\\\\")
+                .replace("|", "\\|").replace("\r", " ").replace("\n", " "))
+
+    def elapsed(value: Any) -> str:
+        return f"{value:,.1f} ms" if isinstance(value, (int, float)) else "Unknown"
+
+    def tokens(usage: dict[str, Any], planned: int) -> str:
+        value = usage.get("total_tokens")
+        if usage.get("complete") and isinstance(value, (int, float)):
+            return f"{int(value):,}"
+        return f"Unknown ({usage.get('known_cells', 0)}/{planned} cells known)"
+
+    def cost(usage: dict[str, Any], planned: int) -> str:
+        value = usage.get("cost_usd")
+        if usage.get("cost_complete") and isinstance(value, (int, float)):
+            return f"${value:,.4f}"
+        return f"Unknown ({usage.get('cost_known_cells', 0)}/{planned} cells known)"
+
+    def cell_overlap(arm: str, overlap: Any) -> str:
+        if arm == "stock":
+            return "n/a"
+        if not isinstance(overlap, dict) or not isinstance(overlap.get("max_concurrency"), (int, float)):
+            return "Unknown"
+        status = "verified" if overlap.get("evidenced") else "not verified"
+        return f"{status}; peak {int(overlap['max_concurrency'])}"
+
+    def arm_overlap(case: str, arm: str, attempted: int) -> str:
+        if arm == "stock":
+            return "n/a"
+        selected = [cell for cell in report.get("cells", [])
+                    if cell.get("case") == case and cell.get("arm") == arm]
+        if not selected:
+            return "not run"
+        observed = [cell["overlap"] for cell in selected
+                    if isinstance(cell.get("overlap"), dict)
+                    and isinstance(cell["overlap"].get("max_concurrency"), (int, float))]
+        if not observed:
+            return f"Unknown (0/{attempted} observed)"
+        verified = sum(overlap.get("evidenced") is True for overlap in observed)
+        unknown = attempted - len(observed)
+        result = f"{verified}/{attempted} verified; peak {max(int(item['max_concurrency']) for item in observed)}"
+        return result + (f"; {unknown} unknown" if unknown else "")
+
+    planned = report.get("planned_cells", 0)
+    failed = report.get("failed_cells", [])
+    missing = report.get("missing_cells", [])
+    provider, model = report.get("provider"), report.get("model")
+    model_name = f"{provider}/{model}" if provider and model else model or provider or "unknown"
+    deadline = report.get("deadline_seconds")
+    lines = [
+        "# Pi parallel-work benchmark",
+        "",
+        f"- Run: `{text(report.get('run_id') or 'unknown')}`",
+        f"- Mode/state: {text(report.get('mode') or 'unknown')} / {text(report.get('state') or 'unknown')}",
+        f"- Model: `{text(model_name)}` ({text(report.get('thinking') or 'unknown')})",
+        f"- Deadline: {text(deadline)} s" if deadline is not None else "- Deadline: unknown",
+        f"- Cells: {report.get('recorded_cells', 0)}/{planned} recorded; "
+        f"{report.get('passed_cells', 0)} passed; {len(failed)} failed; {len(missing)} not run",
+        "",
+        "Median time uses passing cells only. Speedup is stock time divided by arm time, "
+        "using only passing paired repetitions; values above 1× are faster.",
+    ]
+
+    for case, case_report in report.get("cases", {}).items():
+        lines.extend(["", f"## {text(case)}", "",
+                      "| Arm | Passed / planned | Failed | Not run | Pass rate | Median time | "
+                      "Paired speedup vs stock | Tokens | Cost (USD) | Child overlap |",
+                      "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"])
+        paired = case_report.get("paired_speedup", {})
+        for arm, metrics in case_report.get("arms", {}).items():
+            pairs = paired.get(arm, {})
+            speedup = ("baseline" if arm == "stock" else
+                       f"{pairs['median_speedup']:.2f}× (n={pairs['pairs']})"
+                       if pairs.get("median_speedup") is not None else "n/a (0 pairs)")
+            rate = metrics.get("success_rate")
+            pass_rate = f"{rate:.1%}" if isinstance(rate, (int, float)) else "Unknown"
+            usage = metrics.get("usage", {})
+            lines.append(
+                f"| {text(arm)} | {metrics.get('passed', 0)}/{metrics.get('planned', 0)} | "
+                f"{metrics.get('failed', 0)} | {metrics.get('not_run', 0)} | {pass_rate} | "
+                f"{elapsed(metrics.get('median_elapsed_ms'))} | {speedup} | "
+                f"{tokens(usage, metrics.get('planned', 0))} | "
+                f"{cost(usage, metrics.get('planned', 0))} | "
+                f"{arm_overlap(case, arm, metrics.get('attempted', 0))} |"
+            )
+
+        cells = [cell for cell in report.get("cells", []) if cell.get("case") == case]
+        if cells:
+            lines.extend(["", "### Attempted cells", "",
+                          "| Repetition | Arm | Status | Correct | Time | Tokens | Child overlap | Failure |",
+                          "|---:|---|---|---|---:|---:|---|---|"])
+            for cell in cells:
+                usage = cell.get("usage")
+                total = (f"{int(usage['total_tokens']):,}"
+                         if isinstance(usage, dict) and usage.get("known")
+                         and isinstance(usage.get("total_tokens"), (int, float)) else "Unknown")
+                correct = ("yes" if cell.get("correct") is True else
+                           "no" if cell.get("correct") is False else "Unknown")
+                failures = "; ".join(str(item) for item in cell.get("failures", [])) or "—"
+                lines.append(
+                    f"| {text(cell.get('repetition', 'unknown'))} | {text(cell.get('arm', 'unknown'))} | "
+                    f"{text(cell.get('status') or 'unknown')} | {correct} | "
+                    f"{elapsed(cell.get('elapsed_ms'))} | {total} | "
+                    f"{cell_overlap(cell.get('arm', ''), cell.get('overlap'))} | {text(failures)} |"
+                )
+        else:
+            lines.extend(["", "No cells recorded for this case."])
+
+        absent = [cell for cell in missing if cell.get("case") == case]
+        if absent:
+            lines.extend(["", "### Not run", "",
+                          "| Repetition | Arm |", "|---:|---|"])
+            lines.extend(f"| {text(cell.get('repetition', 'unknown'))} | {text(cell.get('arm', 'unknown'))} |"
+                         for cell in absent)
+
+    if not report.get("cases"):
+        lines.extend(["", "No case metrics are available."])
+    return "\n".join(lines) + "\n"
+
+
 def _load_cells(run_dir: Path) -> list[dict[str, Any]]:
     return [json.loads(path.read_text()) for path in sorted(run_dir.glob("cells/*/cell.json"))]
 
@@ -961,8 +1421,11 @@ def _save_report(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         "run_id": manifest["run_id"], "run_dir": str(run_dir.resolve()),
         "mode": manifest["mode"], "state": manifest["state"],
         "preflight_passed": manifest["preflight"].get("passed", False),
+        "provider": manifest.get("provider"), "model": manifest.get("model"),
+        "thinking": manifest.get("thinking"),
+        "deadline_seconds": manifest.get("deadline_seconds"),
     })
-    _write_json(run_dir / "report.json", report)
+    _write_report_files(run_dir, report)
     _write_json(run_dir / "run.json", manifest)
     return report
 
@@ -1039,7 +1502,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-root", type=Path, default=default_cache_root())
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("install", help="install and verify the exact pinned extension packages")
-    commands.add_parser("preflight", help="check wrapper, credentials, package pins, and isolation prerequisites")
+    commands.add_parser("preflight", help="check wrapper, package pins, and isolation prerequisites")
     run = commands.add_parser("run", help="run one fresh benchmark cell")
     run.add_argument("--case", choices=CASES, required=True)
     run.add_argument("--arm", choices=ARMS, required=True)
@@ -1085,8 +1548,11 @@ def main(argv: list[str] | None = None) -> int:
             repetition_ids = manifest.get("repetition_ids") if args.repetitions is None else None
             result = build_report(cells, repetitions, cases, arms, repetition_ids)
             result.update({"run_dir": str(run_dir), "run_id": manifest.get("run_id"),
-                           "mode": manifest.get("mode"), "state": manifest.get("state")})
-            _write_json(run_dir / "report.json", result)
+                           "mode": manifest.get("mode"), "state": manifest.get("state"),
+                           "provider": manifest.get("provider"), "model": manifest.get("model"),
+                           "thinking": manifest.get("thinking"),
+                           "deadline_seconds": manifest.get("deadline_seconds")})
+            _write_report_files(run_dir, result)
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0
         if args.command == "run":
