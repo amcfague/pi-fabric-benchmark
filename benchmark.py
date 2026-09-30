@@ -349,6 +349,7 @@ def _tintin_agent_specs(tasks: list[dict[str, str]]) -> list[dict[str, Any]]:
     return [{
         "prompt": task["task"], "description": f"Handle {task['key']} task",
         "name": task["key"], "subagent_type": "general-purpose",
+        "model": f"{PROVIDER}/{MODEL}", "thinking": THINKING, "max_turns": 10,
         "run_in_background": False, "isolated": True, "inherit_context": False,
         "isolation": "off",
     } for task in tasks]
@@ -400,9 +401,10 @@ def build_prompt(case: str, arm: str, project_dir: Path, deadline_seconds: int =
         return (
             base + f"\n\nDelegate exactly {task_description} {delegation_mode}; child cap is {task_count}. "
             "Use the loaded Agent tool from @tintinweb/pi-subagents, not the other subagents package. "
-            "Invoke each argument object below once in the same assistant tool-call batch. Settle every call inline; "
-            "do not use workflows, background agents, or any other tools. The isolated general-purpose agents "
-            "have only built-in tools and fresh context. Leave model and thinking unset so they inherit the parent. "
+            "Emit all Agent calls in one assistant message, without waiting between siblings; Pi runs that tool-call batch concurrently. "
+            "Keep run_in_background false and collect inline results after the batch settles. Do not use workflows, "
+            "background agents, or any other tools. The isolated general-purpose agents "
+            "have only built-in tools and fresh context. Set model, thinking, and max_turns exactly as shown. "
             "Use only child results; do not inspect fixture files in the parent. Synthesize after all children finish.\n\n"
             "Agent arguments = " + json.dumps(_tintin_agent_specs(tasks), indent=2)
         )
@@ -809,9 +811,14 @@ def extract_children(
             if (end.get("isError") is not False or not isinstance(key, str)
                     or not isinstance(identifier, str) or details.get("status") != "completed"):
                 continue
+            tags = details.get("tags")
+            thinking = next((tag.partition(": ")[2] for tag in tags
+                             if isinstance(tag, str) and tag.startswith("thinking: ")), None) \
+                if isinstance(tags, list) else None
             item = {
                 "id": identifier, "key": key,
-                "agent": args.get("subagent_type"), "status": "completed", "state": "completed",
+                "agent": args.get("subagent_type"), "model": args.get("model"), "thinking": thinking,
+                "status": "completed", "state": "completed",
             }
             call_id = start.get("toolCallId")
             observed = tool_call_times.get(call_id, {}) if isinstance(tool_call_times, dict) else {}
@@ -968,6 +975,16 @@ def child_launch_evidence(
             args.get("name"): args for _, event in starts
             if isinstance((args := event.get("args")), dict)
         }
+        schema_defaults = {"resume": "", "schedule": ""}
+
+        def matches_spec(args: Any, spec: dict[str, Any]) -> bool:
+            return (
+                isinstance(args, dict)
+                and all(args.get(key) == value for key, value in spec.items())
+                and all(key in spec or (key in schema_defaults and value == schema_defaults[key])
+                        for key, value in args.items())
+            )
+
         completed = all(
             end.get("isError") is False
             and isinstance(end.get("result"), dict)
@@ -979,7 +996,8 @@ def child_launch_evidence(
         valid = (
             len(starts) == len(ends) == len(pairs) == len(expected_specs)
             and len(starts_by_name) == len(expected_specs)
-            and all(starts_by_name.get(name) == spec for name, spec in expected_specs.items())
+            and all(matches_spec(starts_by_name.get(name), spec)
+                    for name, spec in expected_specs.items())
             and completed and same_batch
             and all(name == "Agent" for name, _ in calls)
         )
@@ -1233,7 +1251,7 @@ def run_cell(
         len(children) == expected_child_count and all(
             child.get("model") == f"{PROVIDER}/{MODEL}" and child.get("thinking") == THINKING
             for child in children
-        ) if arm == "subagents" else launches["verified"] if arm == "tintin-subagents" else True
+        ) if arm in ("subagents", "tintin-subagents") else True
     )
     overlap = overlap_summary(children)
     child_usage_records = [item["usage"] for item in children if isinstance(item.get("usage"), dict)]

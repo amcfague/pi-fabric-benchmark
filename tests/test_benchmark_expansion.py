@@ -145,6 +145,7 @@ class ExpandedBenchmarkTests(unittest.TestCase):
                     result = {"content": [{"type": "text", "text": "done"}], "details": {
                         "agentId": f"id-{index}", "status": "completed",
                         "turnCount": index + 2, "durationMs": 3000,
+                        "tags": ["twin", "thinking: xhigh"],
                     }}
                     if index == len(specs) - 1:
                         result["usage"] = {

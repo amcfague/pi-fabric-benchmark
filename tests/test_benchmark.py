@@ -222,6 +222,11 @@ class LauncherChecks(unittest.TestCase):
         self.assertIn('run_in_background', tintin)
         self.assertIn('isolated', tintin)
         self.assertIn('Agent arguments =', tintin)
+        self.assertIn('one assistant message, without waiting between siblings', tintin)
+        tintin_specs = json.loads(tintin.partition('Agent arguments = ')[2])
+        self.assertTrue(all(spec['model'] == f'{benchmark.PROVIDER}/{benchmark.MODEL}'
+                            and spec['thinking'] == benchmark.THINKING
+                            and spec['max_turns'] == 10 for spec in tintin_specs))
 
     def test_success_requires_settled_agent_and_nonerror_final_stop(self):
         good = [
@@ -596,6 +601,55 @@ class LauncherChecks(unittest.TestCase):
             self.assertEqual(len(extract_children(bad_events, 'subagents', session_dir)), 2)
             self.assertFalse(child_launch_evidence(
                 'subagents', bad_events, 'triage', project_dir, deadline)['verified'])
+
+    def test_tintin_launch_accepts_only_schema_defaults_and_extracts_effective_settings(self):
+        project_dir = Path('/cell/project')
+        specs = benchmark._tintin_agent_specs(benchmark._child_tasks('triage', project_dir))
+        events = [
+            {'type': 'tool_execution_start', 'toolCallId': f'agent-{index}',
+             'toolName': 'Agent', 'args': {**spec, 'resume': '', 'schedule': ''}}
+            for index, spec in enumerate(specs)
+        ]
+        events.extend(
+            {'type': 'tool_execution_end', 'toolCallId': f'agent-{index}',
+             'toolName': 'Agent', 'result': {
+                 'details': {'agentId': f'child-{index}', 'status': 'completed',
+                             'turnCount': 2, 'durationMs': 100,
+                             'tags': ['twin', 'thinking: xhigh']},
+                 'usage': {'input': 1, 'output': 2, 'cacheRead': 3,
+                           'cacheWrite': 4, 'totalTokens': 10},
+             }, 'isError': False}
+            for index, _ in enumerate(specs)
+        )
+        launch = child_launch_evidence('tintin-subagents', events, 'triage', project_dir, 900)
+        self.assertTrue(launch['verified'], launch)
+        tool_call_times = {
+            f'agent-{index}': {'start': index + 1, 'end': index + 10}
+            for index in range(len(specs))
+        }
+        children = extract_children(events, 'tintin-subagents', tool_call_times=tool_call_times)
+        self.assertEqual(len(children), 3)
+        self.assertTrue(all(child['model'] == f'{benchmark.PROVIDER}/{benchmark.MODEL}'
+                            and child['thinking'] == benchmark.THINKING for child in children))
+        self.assertTrue(all(child['usage']['known'] for child in children))
+        self.assertEqual([child['turns'] for child in children], [2, 2, 2])
+        self.assertEqual(overlap_summary(children)['max_concurrency'], 3)
+
+        sequential = [event for index in range(len(specs))
+                      for event in (events[index], events[len(specs) + index])]
+        self.assertFalse(child_launch_evidence(
+            'tintin-subagents', sequential, 'triage', project_dir, 900)['verified'])
+
+        wrong_thinking = list(events)
+        wrong_thinking[0] = {**wrong_thinking[0],
+                             'args': {**wrong_thinking[0]['args'], 'thinking': 'medium'}}
+        self.assertFalse(child_launch_evidence(
+            'tintin-subagents', wrong_thinking, 'triage', project_dir, 900)['verified'])
+        stale_resume = list(events)
+        stale_resume[0] = {**stale_resume[0],
+                           'args': {**stale_resume[0]['args'], 'resume': 'old-agent'}}
+        self.assertFalse(child_launch_evidence(
+            'tintin-subagents', stale_resume, 'triage', project_dir, 900)['verified'])
 
     def test_fabric_comment_wrapped_code_does_not_verify_child_launch(self):
         project_dir = Path('/cell/project')
