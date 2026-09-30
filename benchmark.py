@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated local benchmark for stock Pi, pi-subagents, and pi-fabric."""
+"""Isolated local benchmark for stock Pi, two subagents packages, and pi-fabric."""
 from __future__ import annotations
 
 import argparse
@@ -26,25 +26,31 @@ PI_BINARY = "/usr/local/bin/pi"
 PROVIDER = "openai"
 MODEL = "gpt-6-sol"
 THINKING = "xhigh"
-CHILD_CAP = 3
+CHILD_CAP = 4
 DEFAULT_DEADLINE = 900
 CORE_TOOLS = ("read", "grep", "find", "ls", "bash", "edit", "write")
-ARMS = ("stock", "subagents", "fabric")
+ARMS = ("stock", "subagents", "tintin-subagents", "fabric")
 ARM_EXTENSION_TOOLS = {
     "subagents": ("subagents_enable", "subagent"),
+    "tintin-subagents": ("Agent",),
     "fabric": ("fabric_exec",),
 }
-CASES = ("triage", "patch")
+CASES = ("triage", "patch", "control", "debug", "integration")
 PINS = {
     "subagents": {
         "name": "pi-subagents", "version": "0.73.1",
         "integrity": "sha512-IklOqw67DtvIWQFKxFJpDFXsOGcq8RGYZEbokykD5Kvfs9aa/du1cW2NEJ5xx4GUgN2LVt3vAq5IdzEMo7YwJw==",
+    },
+    "tintin-subagents": {
+        "name": "@tintinweb/pi-subagents", "version": "0.19.0",
+        "integrity": "sha512-DZsU33Urfb9dhEsJmsmpx0dayIHMYUbxng6AA7B6+bIgspNcTckcSnQRsbrv+QCS7jVKYJTzHIT/j1SU2B/nVQ==",
     },
     "fabric": {
         "name": "pi-fabric", "version": "0.100.0",
         "integrity": "sha512-tW1DBe8cZYN91yezHHud5R3nLCV8LU2/1rS69f9u0LnsuuDXBVpxbEa06o2sbiJuANMxIJ1PGf+2wGXdGWqAmg==",
     },
 }
+HOST_RUNTIME_ARMS = ("subagents", "tintin-subagents")
 SUBAGENT_RUNTIME_PIN = {
     "name": "@earendil-works/pi-coding-agent", "version": "0.87.1",
     "integrity": "sha512-m8ArJUtVcQMSe1lLE/Ei7vX/JV7O39sWmWBsXV2NOU70F0qCp8GubA24pT3LnwTmM6LL2xV80/h6sQg85n69ew==",
@@ -113,7 +119,7 @@ def inspect_package(arm: str, cache_root: Path) -> dict[str, Any]:
     entry = (root / extensions[0]).resolve()
     if not entry.is_file() or not entry.is_relative_to(root):
         raise ValueError(f"invalid extension entry point for {pin['name']}: {entry}")
-    prefix = root.parents[1]
+    prefix = cache_root / "packages" / arm
     lock_path = prefix / "package-lock.json"
     lock_integrity = None
     if lock_path.is_file():
@@ -130,9 +136,9 @@ def inspect_package(arm: str, cache_root: Path) -> dict[str, Any]:
     }
 
 
-def inspect_subagents_runtime(cache_root: Path) -> dict[str, Any]:
+def inspect_host_runtime(cache_root: Path, package_arm: str) -> dict[str, Any]:
     pin = SUBAGENT_RUNTIME_PIN
-    prefix = cache_root / "packages" / "subagents"
+    prefix = cache_root / "packages" / package_arm
     root = prefix / "node_modules" / "@earendil-works" / "pi-coding-agent"
     metadata_path = root / "package.json"
     if not metadata_path.is_file():
@@ -165,7 +171,7 @@ def install_packages(cache_root: Path) -> dict[str, Any]:
         if actual != pin["integrity"]:
             raise RuntimeError(f"registry integrity changed for {spec}; expected pinned tarball")
         specs = [spec]
-        if arm == "subagents":
+        if arm in HOST_RUNTIME_ARMS:
             runtime = SUBAGENT_RUNTIME_PIN
             runtime_spec = f"{runtime['name']}@{runtime['version']}"
             if npm_integrity(runtime_spec) != runtime["integrity"]:
@@ -183,8 +189,8 @@ def install_packages(cache_root: Path) -> dict[str, Any]:
         if not info["integrity_verified"]:
             raise RuntimeError(f"npm lock did not verify the tarball integrity for {spec}")
         info["registry_integrity_verified"] = True
-        if arm == "subagents":
-            host_runtime = inspect_subagents_runtime(cache_root)
+        if arm in HOST_RUNTIME_ARMS:
+            host_runtime = inspect_host_runtime(cache_root, arm)
             if not host_runtime["integrity_verified"]:
                 raise RuntimeError(f"npm lock did not verify the tarball integrity for {runtime_spec}")
             host_runtime["registry_integrity_verified"] = True
@@ -255,6 +261,35 @@ def build_environment(
 
 
 def _child_tasks(case: str, project_dir: Path) -> list[dict[str, str]]:
+    if case == "control":
+        return [{
+            "key": "billing",
+            "task": (
+                f"Read only billing.py in {project_dir}. Evaluate subtotal_cents(1250, 4) "
+                "from the fixture and return one JSON object with numeric fields "
+                "observed_cents and required_cents. Do not edit files."
+            ),
+        }]
+    if case == "integration":
+        return [
+            {"key": "catalog", "task": (
+                f"Modify only catalog.py in {project_dir}. Fix inventory to subtract "
+                "reservations and clamp at zero. Preserve its public API."
+            )},
+            {"key": "billing", "task": (
+                f"Modify only billing.py in {project_dir}. Fix subtotal to multiply "
+                "integer unit-price cents by quantity. Preserve its public API."
+            )},
+            {"key": "shipping-fee", "task": (
+                f"Modify only shipping_fee_cents in shipping.py in {project_dir}. "
+                "Waive shipping at and above the free threshold; preserve quote_order."
+            )},
+            {"key": "checkout-total", "task": (
+                f"Modify only quote_order in shipping.py in {project_dir}. Add "
+                "grand_total_cents as subtotal plus shipping fee; preserve existing keys "
+                "and shipping_fee_cents."
+            )},
+        ]
     files = ("catalog.py", "billing.py", "shipping.py")
     tasks = []
     for filename in files:
@@ -280,6 +315,13 @@ def _child_tasks(case: str, project_dir: Path) -> list[dict[str, str]]:
                 f"Modify only {filename} in {project_dir}. Fix its behavior to {contract}; preserve "
                 "the public function name, signature, and return shape. Do not edit other files."
             )
+            if case == "debug":
+                test = {
+                    "catalog": "test_available_units_subtracts_reservations",
+                    "billing": "test_subtotal_multiplies_unit_cents",
+                    "shipping": "test_free_shipping_includes_threshold",
+                }[module]
+                task += f" Read test_contracts.py and fix the cause of {test}; do not edit tests."
         tasks.append({"key": module, "task": task})
     return tasks
 
@@ -303,6 +345,15 @@ def _fabric_script(tasks: list[dict[str, str]], project_dir: Path, child_timeout
     )
 
 
+def _tintin_agent_specs(tasks: list[dict[str, str]]) -> list[dict[str, Any]]:
+    return [{
+        "prompt": task["task"], "description": f"Handle {task['key']} task",
+        "name": task["key"], "subagent_type": "general-purpose",
+        "run_in_background": False, "isolated": True, "inherit_context": False,
+        "isolation": "off",
+    } for task in tasks]
+
+
 def build_prompt(case: str, arm: str, project_dir: Path, deadline_seconds: int = DEFAULT_DEADLINE) -> str:
     if case not in CASES or arm not in ARMS:
         raise ValueError("unknown case or arm")
@@ -311,6 +362,10 @@ def build_prompt(case: str, arm: str, project_dir: Path, deadline_seconds: int =
     if arm == "stock":
         return base
     tasks = _child_tasks(case, project_dir)
+    task_count = len(tasks)
+    task_description = f"{task_count} independent task{'s' if task_count != 1 else ''}"
+    task_records = f"{task_count} returned child record{'s' if task_count != 1 else ''}"
+    delegation_mode = "in parallel" if task_count > 1 else "as one delegated child"
     child_timeout = deadline_seconds * 1000
     if arm == "subagents":
         children = [
@@ -319,7 +374,7 @@ def build_prompt(case: str, arm: str, project_dir: Path, deadline_seconds: int =
                 "async": False, "tools": ",".join(CORE_TOOLS), "extensions": [], "skills": [],
                 "acceptance": {
                     "level": "none",
-                    "reason": "Read-only benchmark output is checked by the parent grader",
+                    "reason": "Benchmark output is checked by the parent grader",
                 },
                 "context": "fresh", "cwd": str(project_dir), "worktree": False,
                 "timeoutMs": child_timeout,
@@ -331,30 +386,54 @@ def build_prompt(case: str, arm: str, project_dir: Path, deadline_seconds: int =
             "const results = await runs.all(children);\nconsole.log(JSON.stringify({ children: results }));\nreturn { children: results };"
         )
         return (
-            base + f"\n\nDelegate exactly these three independent tasks in parallel; child cap is {CHILD_CAP}. "
+            base + f"\n\nDelegate exactly {task_description} {delegation_mode}; child cap is {task_count}. "
             "Use the pi-subagents workflow, never another runtime. Call subagents_enable first, "
             "then call subagent({action:\"list\",capabilities:true}) and make exactly one top-level workflow call with this script and async:false. "
-            "Wait for the workflow tool to finish. Synthesize from its three returned child records; if inline output is empty, read only that child's returned sessionFile for its final assistant response. Never read fixture source in the parent. "
+            f"Wait for the workflow tool to finish. Synthesize from its {task_records}; if inline output is empty, read only that child's returned sessionFile for its final assistant response. Never read fixture source in the parent. "
             "The workflow must use runs.all once. Each child runs foreground with async:false and inherits the parent provider and model; private cell worker settings match the parent thinking level. Pass no per-run model or thinking override. "
-            "Each child sets acceptance to none because the parent grader checks these read-only results. Children have extensions: [] and skills: []; do not change their tools, cwd, or deadline.\n\n"
+            "Each child sets acceptance to none because the parent grader checks each benchmark result. Children have extensions: [] and skills: []; do not change their tools, cwd, or deadline.\n\n"
             "workflowScript = " + json.dumps(script) + "\n"
             f"Outer request: cwd={json.dumps(str(project_dir))}, async=false, "
             f"timeoutMs={child_timeout}, mission=false."
         )
+    if arm == "tintin-subagents":
+        return (
+            base + f"\n\nDelegate exactly {task_description} {delegation_mode}; child cap is {task_count}. "
+            "Use the loaded Agent tool from @tintinweb/pi-subagents, not the other subagents package. "
+            "Invoke each argument object below once in the same assistant tool-call batch. Settle every call inline; "
+            "do not use workflows, background agents, or any other tools. The isolated general-purpose agents "
+            "have only built-in tools and fresh context. Leave model and thinking unset so they inherit the parent. "
+            "Use only child results; do not inspect fixture files in the parent. Synthesize after all children finish.\n\n"
+            "Agent arguments = " + json.dumps(_tintin_agent_specs(tasks), indent=2)
+        )
     script = _fabric_script(tasks, project_dir, child_timeout)
     return (
-        base + f"\n\nDelegate exactly these three independent tasks concurrently; child cap is {CHILD_CAP}. "
+        base + f"\n\nDelegate exactly {task_description} {delegation_mode}; child cap is {task_count}. "
         "Call the loaded fabric_exec tool once with the following TypeScript. Do not perform the "
         "tasks in the parent. Each agents.run leaf must use extensions:false, the same model, "
         "thinking level, core tools, cwd, and deadline shown in the code. Return the child records "
-        "and synthesize only after all three finish.\n\n"
+        "and synthesize only after every child finishes.\n\n"
         "fabric_exec code = " + json.dumps(script)
     )
 
 
-def _pump(stream: Any, path: Path) -> None:
+def _pump(
+    stream: Any, path: Path, tool_call_times: dict[str, dict[str, float]] | None = None,
+    observed_tools: tuple[str, ...] = (),
+) -> None:
     with path.open("wb") as output:
         for line in iter(stream.readline, b""):
+            if tool_call_times is not None and observed_tools:
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    event = {}
+                kind = event.get("type", event.get("event"))
+                call_id = event.get("toolCallId")
+                if (event.get("toolName") in observed_tools and isinstance(call_id, str)
+                        and kind in ("tool_execution_start", "tool_execution_end")):
+                    field = "start" if kind == "tool_execution_start" else "end"
+                    tool_call_times.setdefault(call_id, {})[field] = time.monotonic() * 1000
             output.write(line)
             output.flush()
 
@@ -383,6 +462,7 @@ def _terminate_process(process: subprocess.Popen, grace_seconds: float) -> None:
 def run_process(
     command: list[str], cwd: Path, env: dict[str, str], event_path: Path, stderr_path: Path,
     deadline_seconds: float, terminate_grace_seconds: float = 3.0,
+    observed_tools: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     event_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
@@ -391,7 +471,10 @@ def run_process(
         command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=(os.name == "posix"),
     )
-    stdout_thread = threading.Thread(target=_pump, args=(process.stdout, event_path), daemon=True)
+    tool_call_times: dict[str, dict[str, float]] = {}
+    stdout_thread = threading.Thread(
+        target=_pump, args=(process.stdout, event_path, tool_call_times, observed_tools), daemon=True,
+    )
     stderr_thread = threading.Thread(target=_pump, args=(process.stderr, stderr_path), daemon=True)
     stdout_thread.start()
     stderr_thread.start()
@@ -412,6 +495,7 @@ def run_process(
         "exit_code": process.returncode, "timed_out": timed_out, "interrupted": interrupted,
         "elapsed_ms": round((time.monotonic() - started) * 1000),
         "termination_reason": "interrupted" if interrupted else "deadline" if timed_out else "process_exit",
+        "tool_call_times": tool_call_times,
     }
 
 
@@ -471,6 +555,10 @@ def _usage_record(raw: Any) -> dict[str, Any] | None:
     return values
 
 
+def _turn_number(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
 def _sum_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
     fields = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "total_tokens", "cost_usd")
     output: dict[str, Any] = {field: None for field in fields}
@@ -486,6 +574,7 @@ def parse_events(events: list[dict[str, Any]], exit_code: int | None) -> dict[st
     settled = False
     agent_end = False
     assistant_messages: list[dict[str, Any]] = []
+    turn_ids: set[str] = set()
     usage_by_id: dict[str, dict[str, Any]] = {}
     for index, event in enumerate(events):
         kind = event.get("type", event.get("event"))
@@ -496,6 +585,8 @@ def parse_events(events: list[dict[str, Any]], exit_code: int | None) -> dict[st
         message = event.get("message")
         if kind == "message_end" and isinstance(message, dict) and message.get("role") == "assistant":
             assistant_messages.append(message)
+            message_id = message.get("id")
+            turn_ids.add(str(message_id) if isinstance(message_id, (str, int)) else f"event:{index}")
             usage = _usage_record(message.get("usage"))
             if usage:
                 usage_by_id[str(message.get("id", index))] = usage
@@ -505,7 +596,7 @@ def parse_events(events: list[dict[str, Any]], exit_code: int | None) -> dict[st
     usage = _sum_usage(list(usage_by_id.values()))
     return {
         "settled": settled, "agent_end": agent_end, "final_stop_reason": stop,
-        "answer": answer, "usage": usage,
+        "answer": answer, "usage": usage, "turns": len(turn_ids) if turn_ids else None,
         "success": exit_code == 0 and settled and stop in ("stop", "end_turn", "endTurn"),
     }
 
@@ -583,9 +674,10 @@ def _session_result(path: Path) -> dict[str, Any] | None:
     started_at = ended_at = None
     model = thinking = None
     output = ""
+    turn_ids: set[str] = set()
     try:
         with path.open(encoding="utf-8") as session:
-            for line in session:
+            for index, line in enumerate(session):
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
@@ -601,10 +693,11 @@ def _session_result(path: Path) -> dict[str, Any] | None:
                     started_at = timestamp
                 message = event.get("message")
                 if (event.get("type") != "message" or not isinstance(message, dict)
-                        or message.get("role") != "assistant"
-                        or message.get("stopReason") not in ("stop", "end_turn", "endTurn")):
+                        or message.get("role") != "assistant"):
                     continue
-                if timestamp is None:
+                message_id = message.get("id")
+                turn_ids.add(str(message_id) if isinstance(message_id, (str, int)) else f"event:{index}")
+                if message.get("stopReason") not in ("stop", "end_turn", "endTurn") or timestamp is None:
                     continue
                 ended_at = timestamp
                 content = message.get("content", [])
@@ -621,7 +714,7 @@ def _session_result(path: Path) -> dict[str, Any] | None:
         return None
     if started_at is None or ended_at is None or ended_at <= started_at or not output.strip():
         return None
-    return {"startedAt": started_at, "endedAt": ended_at, "output": output, "model": model, "thinking": thinking}
+    return {"startedAt": started_at, "endedAt": ended_at, "output": output, "model": model, "thinking": thinking, "turns": len(turn_ids)}
 
 
 def _returned_session_files(events: list[dict[str, Any]], session_dir: Path) -> set[Path]:
@@ -688,6 +781,11 @@ def _subagents_child_records(result: Any, session_dir: Path) -> list[dict[str, A
             item["extensionModel"] = row["model"]
         if isinstance(row.get("thinking"), str):
             item["extensionThinking"] = row["thinking"]
+        row_usage = row.get("usage")
+        turns = _turn_number(row_usage.get("turns")) if isinstance(row_usage, dict) else None
+        turns = turns if turns is not None else _turn_number(session.get("turns"))
+        if turns is not None:
+            item["turns"] = turns
         usage = _usage_record(row.get("usage"))
         if usage is not None:
             item["usage"] = usage
@@ -697,10 +795,41 @@ def _subagents_child_records(result: Any, session_dir: Path) -> list[dict[str, A
 
 def extract_children(
     events: list[dict[str, Any]], arm: str, session_dir: Path | None = None,
+    tool_call_times: dict[str, dict[str, float]] | None = None,
 ) -> list[dict[str, Any]]:
-    if arm not in ("subagents", "fabric"):
+    if arm not in ("subagents", "tintin-subagents", "fabric"):
         return []
     found: dict[str, dict[str, Any]] = {}
+    if arm == "tintin-subagents":
+        for start, end in _completed_tool_calls(events, "Agent"):
+            args, result = start.get("args"), end.get("result")
+            details = result.get("details") if isinstance(result, dict) else None
+            key = args.get("name") if isinstance(args, dict) else None
+            identifier = details.get("agentId") if isinstance(details, dict) else None
+            if (end.get("isError") is not False or not isinstance(key, str)
+                    or not isinstance(identifier, str) or details.get("status") != "completed"):
+                continue
+            item = {
+                "id": identifier, "key": key,
+                "agent": args.get("subagent_type"), "status": "completed", "state": "completed",
+            }
+            call_id = start.get("toolCallId")
+            observed = tool_call_times.get(call_id, {}) if isinstance(tool_call_times, dict) else {}
+            started_at = _time_value(observed, "start") or _timestamp_ms(start.get("timestamp"))
+            ended_at = _time_value(observed, "end") or _timestamp_ms(end.get("timestamp"))
+            if started_at is not None and ended_at is not None and ended_at > started_at:
+                item.update({"startedAt": started_at, "endedAt": ended_at})
+            turns = _turn_number(details.get("turnCount"))
+            if turns is not None:
+                item["turns"] = turns
+            duration = _time_value(details, "durationMs")
+            if duration is not None:
+                item["durationMs"] = duration
+            usage = _usage_record(result.get("usage")) if isinstance(result, dict) else None
+            if usage is not None:
+                item["usage"] = usage
+            found[key] = item
+        return list(found.values())
     if arm == "subagents":
         source_events = [
             end.get("result") for start, end in _completed_tool_calls(events, "subagent")
@@ -740,6 +869,12 @@ def extract_children(
                 item["endedAt"] = end
             if usage is not None:
                 item["usage"] = usage
+            result = record.get("result")
+            turns = _turn_number(record.get("turns"))
+            if turns is None and isinstance(result, dict):
+                turns = _turn_number(result.get("turns"))
+            if turns is not None:
+                item["turns"] = turns
     return list(found.values())
 
 
@@ -812,17 +947,51 @@ def child_launch_evidence(
             and re.sub(r"\s+", "", code) == re.sub(r"\s+", "", expected_code)
             and all(name == "fabric_exec" for name, _ in calls)
         )
-        reason = "one successful fabric_exec call ran three isolated agents in parallel" if valid else "Fabric child launch is unverified"
+        reason = "one successful fabric_exec call completed the expected child tasks" if valid else "Fabric child launch is unverified"
         return {"verified": valid, "tool_calls": [name for name, _ in calls], "reason": reason}
     expected_cwd = re.escape(json.dumps(str(project_dir)))
     expected_tasks = _child_tasks(case, project_dir)
+    if arm == "tintin-subagents":
+        expected_specs = {spec["name"]: spec for spec in _tintin_agent_specs(expected_tasks)}
+        starts = [
+            (index, event) for index, event in enumerate(events)
+            if event.get("type", event.get("event")) == "tool_execution_start"
+            and event.get("toolName") == "Agent"
+        ]
+        ends = [
+            (index, event) for index, event in enumerate(events)
+            if event.get("type", event.get("event")) == "tool_execution_end"
+            and event.get("toolName") == "Agent"
+        ]
+        pairs = _completed_tool_calls(events, "Agent")
+        starts_by_name = {
+            args.get("name"): args for _, event in starts
+            if isinstance((args := event.get("args")), dict)
+        }
+        completed = all(
+            end.get("isError") is False
+            and isinstance(end.get("result"), dict)
+            and isinstance(end["result"].get("details"), dict)
+            and end["result"]["details"].get("status") == "completed"
+            for _, end in pairs
+        )
+        same_batch = bool(starts and ends) and max(i for i, _ in starts) < min(i for i, _ in ends)
+        valid = (
+            len(starts) == len(ends) == len(pairs) == len(expected_specs)
+            and len(starts_by_name) == len(expected_specs)
+            and all(starts_by_name.get(name) == spec for name, spec in expected_specs.items())
+            and completed and same_batch
+            and all(name == "Agent" for name, _ in calls)
+        )
+        reason = "verified foreground Agent calls ran in one parallel tool batch" if valid else "Tintin Agent launch or result collection is unverified"
+        return {"verified": valid, "tool_calls": [name for name, _ in calls], "reason": reason}
     if arm == "subagents":
         scripts = [" ".join(_text_values(args)) for name, args in calls if name == "subagent" and isinstance(args, dict) and isinstance(args.get("workflowScript"), str)]
         valid = False
         if len(scripts) == 1:
             script = scripts[0]
 
-            child_count = lambda pattern: len(re.findall(pattern, script)) == CHILD_CAP
+            child_count = lambda pattern: len(re.findall(pattern, script)) == len(expected_tasks)
             valid = (
                 script.count("runs.all") == 1 and script.count("runs.run") == 0
                 and child_count(r'"key"\s*:')
@@ -877,23 +1046,27 @@ def child_launch_evidence(
                     continue
             unexpected_calls.append(name)
         valid = valid and not unexpected_calls
-        reason = "one successful foreground subagent workflow ran three isolated agents in parallel" if valid else "subagent child launch or result collection is unverified"
+        reason = "one successful foreground subagent workflow completed the expected child tasks" if valid else "subagent child launch or result collection is unverified"
         return {"verified": valid, "tool_calls": [name for name, _ in calls], "reason": reason}
     return {"verified": True, "tool_calls": [name for name, _ in calls], "reason": "stock Pi has no delegated children"}
 
 
 def _grade(case: str, project: Path, answer: str) -> dict[str, Any]:
-    if case == "triage":
+    if case in ("triage", "control"):
         try:
             parsed = json.loads(answer)
         except json.JSONDecodeError as error:
             return {"passed": False, "errors": [f"final answer is not JSON: {error.msg}"]}
-        from checks.triage import verify
+        if case == "triage":
+            from checks.triage import verify
+        else:
+            from checks.control import verify
         return verify(parsed)
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "checks" / "patch.py"), str(project)],
-        capture_output=True, text=True, timeout=30,
-    )
+    command = [sys.executable, str(ROOT / "checks" / "patch.py")]
+    if case == "integration":
+        command.append("--integration")
+    command.append(str(project))
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
     try:
         grade = json.loads(result.stdout)
     except json.JSONDecodeError:
@@ -921,7 +1094,7 @@ def preflight(cache_root: Path, pi_binary: str = PI_BINARY, source_env: dict[str
         errors.append(f"Pi wrapper preflight: {error}")
     if pi_version and pi_version.splitlines()[-1].strip() != SUBAGENT_RUNTIME_PIN["version"]:
         errors.append(
-            f"Pi wrapper version does not match the pinned pi-subagents host runtime "
+            f"Pi wrapper version does not match the pinned Pi host runtime "
             f"{SUBAGENT_RUNTIME_PIN['version']}"
         )
     packages = {}
@@ -945,12 +1118,12 @@ def preflight(cache_root: Path, pi_binary: str = PI_BINARY, source_env: dict[str
                 raise ValueError("installed package tree differs from the recorded hash; rerun install")
             if saved.get("integrity") != PINS[arm]["integrity"]:
                 raise ValueError("package manifest does not match the pinned tarball")
-            if arm == "subagents":
+            if arm in HOST_RUNTIME_ARMS:
                 runtime = SUBAGENT_RUNTIME_PIN
                 runtime_spec = f"{runtime['name']}@{runtime['version']}"
                 if npm_integrity(runtime_spec) != runtime["integrity"]:
                     raise ValueError("registry integrity differs from the pinned Pi host runtime")
-                host_runtime = inspect_subagents_runtime(cache_root)
+                host_runtime = inspect_host_runtime(cache_root, arm)
                 host_runtime["registry_integrity_verified"] = True
                 if not host_runtime["integrity_verified"]:
                     raise ValueError("local npm lock does not verify the pinned Pi host runtime")
@@ -1020,6 +1193,8 @@ def run_cell(
     env = build_environment(
         cell_dir, source_env, pi_binary, subagents_runtime_root=subagents_runtime_root,
     )
+    if arm == "tintin-subagents":
+        _write_json(Path(env["PI_CODING_AGENT_DIR"]) / "subagents.json", {"reportUsage": True})
     package_paths = {key: value["entry"] for key, value in packages.items()}
     prompt = build_prompt(case, arm, project, deadline_seconds)
     command = build_command(arm, prompt, session_dir, package_paths, pi_binary)
@@ -1042,25 +1217,43 @@ def run_cell(
         "environment_keys": sorted(key for key in env if key.endswith("_API_KEY") or "proxy" in key.lower()),
         "child_binary": pi_binary,
     }
+    process_options = {"observed_tools": ("Agent",)} if arm == "tintin-subagents" else {}
     result = run_process(
         command, project, env, cell_dir / "events.jsonl", cell_dir / "stderr.log",
-        deadline_seconds,
+        deadline_seconds, **process_options,
     )
     events, malformed = read_events(cell_dir / "events.jsonl")
     agent = parse_events(events, result["exit_code"])
     launches = child_launch_evidence(arm, events, case, project, deadline_seconds)
-    children = extract_children(events, arm=arm, session_dir=session_dir) if launches["verified"] else []
-    child_runtime_matches_parent = arm != "subagents" or (
-        len(children) == CHILD_CAP and all(
+    children = extract_children(
+        events, arm=arm, session_dir=session_dir, tool_call_times=result.get("tool_call_times"),
+    ) if launches["verified"] else []
+    expected_child_count = len(_child_tasks(case, project))
+    child_runtime_matches_parent = (
+        len(children) == expected_child_count and all(
             child.get("model") == f"{PROVIDER}/{MODEL}" and child.get("thinking") == THINKING
             for child in children
-        )
+        ) if arm == "subagents" else launches["verified"] if arm == "tintin-subagents" else True
     )
     overlap = overlap_summary(children)
     child_usage_records = [item["usage"] for item in children if isinstance(item.get("usage"), dict)]
     child_usage = _sum_usage(child_usage_records)
-    if len(child_usage_records) != len(children):
+    if arm == "tintin-subagents":
+        # Tintin drains pooled child spend onto whichever Agent result completes next.
+        child_usage["known"] = child_usage["known"] and len(children) == expected_child_count
+    elif len(child_usage_records) != len(children):
         child_usage["known"] = False
+    parent_turns = _turn_number(agent.get("turns"))
+    child_turn_values = [_turn_number(child.get("turns")) for child in children]
+    child_turns = (0 if arm == "stock" else
+                   sum(child_turn_values) if len(children) == expected_child_count
+                   and all(value is not None for value in child_turn_values) else None)
+    turns_known = parent_turns is not None and child_turns is not None
+    turns = {
+        "known": turns_known, "parent": parent_turns, "children": child_turns,
+        "total": parent_turns + child_turns if turns_known else None,
+    }
+    overlap_required = arm != "stock" and expected_child_count > 1
     usage = {
         "parent": agent["usage"], "children": child_usage,
         "total_tokens": None, "cost_usd": None,
@@ -1097,9 +1290,9 @@ def run_cell(
     if arm != "stock":
         if not launches["verified"]:
             failures.append("child extension loadout is unverified")
-        if len(children) < CHILD_CAP:
-            failures.append(f"expected {CHILD_CAP} child records, found {len(children)}")
-        if not overlap["evidenced"]:
+        if len(children) != expected_child_count:
+            failures.append(f"expected {expected_child_count} child records, found {len(children)}")
+        if overlap_required and not overlap["evidenced"]:
             failures.append("timestamped overlapping child intervals are unverified")
         if not child_runtime_matches_parent:
             failures.append("subagent child model/thinking did not match the parent")
@@ -1120,7 +1313,8 @@ def run_cell(
         "parent_loadout_verified": parent_loadout_verified,
         "child_loadout": launches, "child_runtime_matches_parent": child_runtime_matches_parent,
         "packages": {key: value for key, value in packages.items() if key == arm},
-        "children": children, "overlap": overlap, "usage": usage,
+        "children": children, "overlap": overlap, "overlap_required": overlap_required,
+        "usage": usage, "turns": turns,
         "environment": environment_info,
         "artifacts": {
             "cell": str(cell_dir), "project": str(project),
@@ -1178,6 +1372,30 @@ def _report_usage(cells: list[dict[str, Any]], planned: int) -> dict[str, Any]:
                 result[field] = sum(values)
     if cost_complete:
         result["cost_usd"] = sum(cost_known)
+    for field in ("cache_read_tokens", "cache_write_tokens"):
+        values = [_usage_field(cell, field) for cell in cells]
+        known_values = [value for value in values if isinstance(value, (int, float))]
+        field_complete = len(cells) == planned and len(known_values) == planned
+        result[field] = sum(known_values) if field_complete else None
+        result[f"{field}_complete"] = field_complete
+        result[f"{field}_known_cells"] = len(known_values)
+    return result
+
+
+def _report_turns(cells: list[dict[str, Any]], planned: int) -> dict[str, Any]:
+    known = [cell["turns"] for cell in cells
+             if isinstance(cell.get("turns"), dict) and cell["turns"].get("known")
+             and all(isinstance(cell["turns"].get(key), int)
+                     for key in ("parent", "children", "total"))]
+    complete = len(cells) == planned and len(known) == planned
+    result = {
+        "complete": complete, "known_cells": len(known),
+        "unknown_cells": max(0, planned - len(known)),
+        "parent": None, "children": None, "total": None,
+    }
+    if complete:
+        for field in ("parent", "children", "total"):
+            result[field] = sum(item[field] for item in known)
     return result
 
 
@@ -1209,6 +1427,7 @@ def build_report(
                 "success_rate": len(good) / planned,
                 "median_elapsed_ms": statistics.median([cell["elapsed_ms"] for cell in good]) if good else None,
                 "usage": _report_usage(selected, planned),
+                "turns": _report_turns(selected, planned),
             }
             for cell in selected:
                 if not _cell_passed(cell):
@@ -1253,7 +1472,8 @@ def build_report(
         "case": cell.get("case"), "arm": cell.get("arm"),
         "repetition": cell.get("repetition"), "status": cell.get("status"),
         "correct": cell.get("correct"), "elapsed_ms": cell.get("elapsed_ms"),
-        "usage": cell.get("usage"), "overlap": cell.get("overlap"),
+        "usage": cell.get("usage"), "turns": cell.get("turns"),
+        "overlap": cell.get("overlap"), "overlap_required": cell.get("overlap_required"),
         "failures": cell.get("failures", []),
         "cell": cell.get("artifacts", {}).get("cell"),
     } for cell in cells]
@@ -1285,9 +1505,28 @@ def render_markdown(report: dict[str, Any]) -> str:
             return f"${value:,.4f}"
         return f"Unknown ({usage.get('cost_known_cells', 0)}/{planned} cells known)"
 
-    def cell_overlap(arm: str, overlap: Any) -> str:
+    def metric_tokens(usage: dict[str, Any], field: str, planned: int) -> str:
+        value = usage.get(field)
+        if usage.get(f"{field}_complete") and isinstance(value, (int, float)):
+            return f"{int(value):,}"
+        known = usage.get(f"{field}_known_cells", 0)
+        return f"Unknown ({known}/{planned} cells known)"
+
+    def turn_count(turns: dict[str, Any], planned: int) -> str:
+        value = turns.get("total")
+        if turns.get("complete") and isinstance(value, int):
+            return str(value)
+        return f"Unknown ({turns.get('known_cells', 0)}/{planned} cells known)"
+
+    def cell_metric_tokens(cell: dict[str, Any], field: str) -> str:
+        value = _usage_field(cell, field)
+        return f"{int(value):,}" if isinstance(value, (int, float)) else "Unknown"
+
+    def cell_overlap(case: str, arm: str, overlap: Any) -> str:
         if arm == "stock":
             return "n/a"
+        if len(_child_tasks(case, ROOT / "fixtures" / "project")) <= 1:
+            return "not required"
         if not isinstance(overlap, dict) or not isinstance(overlap.get("max_concurrency"), (int, float)):
             return "Unknown"
         status = "verified" if overlap.get("evidenced") else "not verified"
@@ -1296,6 +1535,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     def arm_overlap(case: str, arm: str, attempted: int) -> str:
         if arm == "stock":
             return "n/a"
+        if len(_child_tasks(case, ROOT / "fixtures" / "project")) <= 1:
+            return "not required"
         selected = [cell for cell in report.get("cells", [])
                     if cell.get("case") == case and cell.get("arm") == arm]
         if not selected:
@@ -1333,8 +1574,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     for case, case_report in report.get("cases", {}).items():
         lines.extend(["", f"## {text(case)}", "",
                       "| Arm | Passed / planned | Failed | Not run | Pass rate | Median time | "
-                      "Paired speedup vs stock | Tokens | Cost (USD) | Child overlap |",
-                      "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"])
+                      "Paired speedup vs stock | Tokens | Cache read tokens | Cache write tokens | Turns | Cost (USD) | Child overlap |",
+                      "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|"])
         paired = case_report.get("paired_speedup", {})
         for arm, metrics in case_report.get("arms", {}).items():
             pairs = paired.get(arm, {})
@@ -1349,6 +1590,9 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"{metrics.get('failed', 0)} | {metrics.get('not_run', 0)} | {pass_rate} | "
                 f"{elapsed(metrics.get('median_elapsed_ms'))} | {speedup} | "
                 f"{tokens(usage, metrics.get('planned', 0))} | "
+                f"{metric_tokens(usage, 'cache_read_tokens', metrics.get('planned', 0))} | "
+                f"{metric_tokens(usage, 'cache_write_tokens', metrics.get('planned', 0))} | "
+                f"{turn_count(metrics.get('turns', {}), metrics.get('planned', 0))} | "
                 f"{cost(usage, metrics.get('planned', 0))} | "
                 f"{arm_overlap(case, arm, metrics.get('attempted', 0))} |"
             )
@@ -1356,21 +1600,27 @@ def render_markdown(report: dict[str, Any]) -> str:
         cells = [cell for cell in report.get("cells", []) if cell.get("case") == case]
         if cells:
             lines.extend(["", "### Attempted cells", "",
-                          "| Repetition | Arm | Status | Correct | Time | Tokens | Child overlap | Failure |",
-                          "|---:|---|---|---|---:|---:|---|---|"])
+                          "| Repetition | Arm | Status | Correct | Time | Tokens | Cache read tokens | Cache write tokens | Turns | Child overlap | Failure |",
+                          "|---:|---|---|---|---:|---:|---:|---:|---:|---|---|"])
             for cell in cells:
                 usage = cell.get("usage")
                 total = (f"{int(usage['total_tokens']):,}"
                          if isinstance(usage, dict) and usage.get("known")
                          and isinstance(usage.get("total_tokens"), (int, float)) else "Unknown")
+                cache_read = cell_metric_tokens(cell, "cache_read_tokens")
+                cache_write = cell_metric_tokens(cell, "cache_write_tokens")
+                turns = cell.get("turns", {})
+                turn_total = (str(turns["total"]) if isinstance(turns, dict)
+                              and turns.get("known") and isinstance(turns.get("total"), int)
+                              else "Unknown")
                 correct = ("yes" if cell.get("correct") is True else
                            "no" if cell.get("correct") is False else "Unknown")
                 failures = "; ".join(str(item) for item in cell.get("failures", [])) or "—"
                 lines.append(
                     f"| {text(cell.get('repetition', 'unknown'))} | {text(cell.get('arm', 'unknown'))} | "
                     f"{text(cell.get('status') or 'unknown')} | {correct} | "
-                    f"{elapsed(cell.get('elapsed_ms'))} | {total} | "
-                    f"{cell_overlap(cell.get('arm', ''), cell.get('overlap'))} | {text(failures)} |"
+                    f"{elapsed(cell.get('elapsed_ms'))} | {total} | {cache_read} | {cache_write} | {turn_total} | "
+                    f"{cell_overlap(case, cell.get('arm', ''), cell.get('overlap'))} | {text(failures)} |"
                 )
         else:
             lines.extend(["", "No cells recorded for this case."])
@@ -1510,7 +1760,10 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--deadline", type=int, default=DEFAULT_DEADLINE)
     smoke = commands.add_parser("smoke", help="run one triage cell per arm")
     smoke.add_argument("--deadline", type=int, default=DEFAULT_DEADLINE)
-    matrix = commands.add_parser("matrix", help="run paired repetitions for each case")
+    matrix = commands.add_parser(
+        "matrix", help="run paired repetitions for each case",
+        description=f"Run paired repetitions across arms: {', '.join(ARMS)}.",
+    )
     matrix.add_argument("--repetitions", type=int, default=3, help="repetitions per case and arm (minimum 3)")
     matrix.add_argument("--deadline", type=int, default=DEFAULT_DEADLINE)
     matrix.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES))

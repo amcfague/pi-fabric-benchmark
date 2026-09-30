@@ -17,6 +17,8 @@ import benchmark
 from checks.patch import verify as verify_patch
 from checks.triage import verify as verify_triage
 from benchmark import (
+    ARMS,
+    HOST_RUNTIME_ARMS,
     PINS,
     _attempt_cell,
     _run_cells,
@@ -28,6 +30,7 @@ from benchmark import (
     child_launch_evidence,
     extract_children,
     inspect_package,
+    inspect_host_runtime,
     build_environment,
     main,
     run_cell,
@@ -46,11 +49,12 @@ TRIAGE = json.loads((ROOT / 'checks' / 'triage.json').read_text())
 class LauncherChecks(unittest.TestCase):
     ENTRIES = {
         'subagents': Path('/cache/pi-subagents/index.js'),
+        'tintin-subagents': Path('/cache/@tintinweb/pi-subagents/src/index.ts'),
         'fabric': Path('/cache/pi-fabric/dist/index.js'),
     }
 
     def test_parent_argv_is_isolated_and_loads_only_the_selected_package(self):
-        for arm in ('stock', 'subagents', 'fabric'):
+        for arm in ARMS:
             with self.subTest(arm=arm):
                 command = build_command(
                     arm, 'task', '/cell/session', self.ENTRIES,
@@ -70,6 +74,7 @@ class LauncherChecks(unittest.TestCase):
                 expected_tools = {
                     'stock': 'read,grep,find,ls,bash,edit,write',
                     'subagents': 'read,grep,find,ls,bash,edit,write,subagents_enable,subagent',
+                    'tintin-subagents': 'read,grep,find,ls,bash,edit,write,Agent',
                     'fabric': 'read,grep,find,ls,bash,edit,write,fabric_exec',
                 }
                 self.assertEqual(command[command.index('--tools') + 1], expected_tools[arm])
@@ -114,10 +119,11 @@ class LauncherChecks(unittest.TestCase):
                 for arm in PINS
             }
             host_pin = benchmark.SUBAGENT_RUNTIME_PIN
-            packages['subagents']['host_runtime'] = {
-                'sha256': 'runtime-hash', 'version': host_pin['version'],
-                'integrity': host_pin['integrity'],
-            }
+            for arm in HOST_RUNTIME_ARMS:
+                packages[arm]['host_runtime'] = {
+                    'sha256': 'runtime-hash', 'version': host_pin['version'],
+                    'integrity': host_pin['integrity'],
+                }
             (cache / 'package-manifest.json').write_text(json.dumps({'packages': packages}))
             integrities = {
                 f"{pin['name']}@{pin['version']}": pin['integrity']
@@ -139,7 +145,7 @@ class LauncherChecks(unittest.TestCase):
                     patch('benchmark.inspect_package', return_value={
                         'sha256': 'package-hash', 'integrity_verified': True,
                     }), \
-                    patch('benchmark.inspect_subagents_runtime', return_value={
+                    patch('benchmark.inspect_host_runtime', return_value={
                         'sha256': 'runtime-hash', 'version': host_pin['version'],
                         'integrity': host_pin['integrity'], 'integrity_verified': True,
                         'root': '/cache/runtime',
@@ -149,28 +155,30 @@ class LauncherChecks(unittest.TestCase):
             self.assertTrue(result['passed'], result['errors'])
             self.assertNotIn('credential_present', result)
 
-    def test_subagents_host_runtime_is_pinned_for_foreground_children(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cache = Path(tmp)
-            prefix = cache / 'packages' / 'subagents'
-            runtime = prefix / 'node_modules' / '@earendil-works' / 'pi-coding-agent'
-            runtime.mkdir(parents=True)
-            pin = benchmark.SUBAGENT_RUNTIME_PIN
-            (runtime / 'package.json').write_text(json.dumps({
-                'name': pin['name'], 'version': pin['version'],
-            }))
-            (prefix / 'package-lock.json').write_text(json.dumps({
-                'packages': {'node_modules/@earendil-works/pi-coding-agent': {
-                    'integrity': pin['integrity'],
-                }},
-            }))
-            info = benchmark.inspect_subagents_runtime(cache)
-            self.assertTrue(info['integrity_verified'])
-            self.assertEqual(info['version'], '0.87.1')
-            env = build_environment(
-                cache / 'cell', {}, '/usr/local/bin/pi', info['root'],
-            )
-            self.assertEqual(env['PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT'], info['root'])
+    def test_pinned_host_runtime_is_installed_per_subagents_package_prefix(self):
+        for arm in HOST_RUNTIME_ARMS:
+            with self.subTest(arm=arm), tempfile.TemporaryDirectory() as tmp:
+                cache = Path(tmp)
+                prefix = cache / 'packages' / arm
+                runtime = prefix / 'node_modules' / '@earendil-works' / 'pi-coding-agent'
+                runtime.mkdir(parents=True)
+                pin = benchmark.SUBAGENT_RUNTIME_PIN
+                (runtime / 'package.json').write_text(json.dumps({
+                    'name': pin['name'], 'version': pin['version'],
+                }))
+                (prefix / 'package-lock.json').write_text(json.dumps({
+                    'packages': {'node_modules/@earendil-works/pi-coding-agent': {
+                        'integrity': pin['integrity'],
+                    }},
+                }))
+                info = inspect_host_runtime(cache, arm)
+                self.assertTrue(info['integrity_verified'])
+                self.assertEqual(info['version'], '0.87.1')
+                if arm == 'subagents':
+                    env = build_environment(
+                        cache / 'cell', {}, '/usr/local/bin/pi', info['root'],
+                    )
+                    self.assertEqual(env['PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT'], info['root'])
 
     def test_pi_real_requires_both_lowercase_proxy_variables(self):
         with self.assertRaises(ValueError):
@@ -209,6 +217,11 @@ class LauncherChecks(unittest.TestCase):
         self.assertIn('Promise.all', fabric)
         self.assertIn('extensions: false', fabric)
         self.assertIn('child cap is 3', fabric)
+        tintin = build_prompt('triage', 'tintin-subagents', Path('/cell/project'))
+        self.assertIn('Agent tool from @tintinweb/pi-subagents', tintin)
+        self.assertIn('run_in_background', tintin)
+        self.assertIn('isolated', tintin)
+        self.assertIn('Agent arguments =', tintin)
 
     def test_success_requires_settled_agent_and_nonerror_final_stop(self):
         good = [
@@ -252,6 +265,27 @@ class LauncherChecks(unittest.TestCase):
             self.assertIn('fake stderr', (root / 'stderr.log').read_text())
             self.assertEqual(json.loads((root / 'events.jsonl').read_text())['type'],
                              'agent_settled')
+
+    def test_run_process_observes_agent_tool_interval_without_mutating_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = root / 'fake-pi'
+            fake.write_text('\n'.join([
+                '#!' + sys.executable,
+                'import json, time',
+                "print(json.dumps({'type':'tool_execution_start','toolCallId':'a','toolName':'Agent'}), flush=True)",
+                'time.sleep(0.02)',
+                "print(json.dumps({'type':'tool_execution_end','toolCallId':'a','toolName':'Agent'}), flush=True)",
+            ]) + '\n')
+            fake.chmod(0o700)
+            result = run_process(
+                [str(fake)], root, {}, root / 'events.jsonl', root / 'stderr.log',
+                deadline_seconds=5, observed_tools=('Agent',),
+            )
+            interval = result['tool_call_times']['a']
+            raw_events = (root / 'events.jsonl').read_text()
+        self.assertLess(interval['start'], interval['end'])
+        self.assertNotIn('observedAt', raw_events)
 
     def test_read_events_ignores_headroom_relay_marker_but_counts_other_corruption(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -297,6 +331,41 @@ class LauncherChecks(unittest.TestCase):
             self.assertTrue(stopped_file.exists(),
                             'child survived process-group termination')
 
+    def test_scoped_package_lock_uses_the_arm_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            prefix = cache / 'packages' / 'tintin-subagents'
+            package = prefix / 'node_modules' / '@tintinweb' / 'pi-subagents'
+            (package / 'src').mkdir(parents=True)
+            (package / 'package.json').write_text(json.dumps({
+                'name': PINS['tintin-subagents']['name'],
+                'version': PINS['tintin-subagents']['version'],
+                'pi': {'extensions': ['./src/index.ts']},
+            }))
+            (package / 'src' / 'index.ts').write_text('// pinned fake entry')
+            runtime = prefix / 'node_modules' / '@earendil-works' / 'pi-coding-agent'
+            runtime.mkdir(parents=True)
+            host_pin = benchmark.SUBAGENT_RUNTIME_PIN
+            (runtime / 'package.json').write_text(json.dumps({
+                'name': host_pin['name'], 'version': host_pin['version'],
+            }))
+            (prefix / 'package-lock.json').write_text(json.dumps({
+                'packages': {
+                    'node_modules/@tintinweb/pi-subagents': {
+                        'integrity': PINS['tintin-subagents']['integrity'],
+                    },
+                    'node_modules/@earendil-works/pi-coding-agent': {
+                        'integrity': host_pin['integrity'],
+                    },
+                },
+            }))
+            info = inspect_package('tintin-subagents', cache)
+            host = inspect_host_runtime(cache, 'tintin-subagents')
+        self.assertTrue(info['integrity_verified'])
+        self.assertTrue(host['integrity_verified'])
+        self.assertEqual(info['name'], '@tintinweb/pi-subagents')
+        self.assertEqual(info['entry'], str((package / 'src' / 'index.ts').resolve()))
+
     def test_package_and_child_records_are_pinned_and_timestamped(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp)
@@ -332,11 +401,11 @@ class LauncherChecks(unittest.TestCase):
             deadline = 900
             raw_children = {'children': [
                 {'key': 'catalog', 'startedAt': 100, 'endedAt': 300,
-                 'result': {'runnerSessionId': 's1', 'usage': {'input': 1, 'output': 2}}},
+                 'result': {'runnerSessionId': 's1', 'usage': {'input': 1, 'output': 2}, 'turns': 2}},
                 {'key': 'billing', 'startedAt': 200, 'endedAt': 400,
-                 'result': {'runnerSessionId': 's2', 'usage': {'input': 3, 'output': 4}}},
+                 'result': {'runnerSessionId': 's2', 'usage': {'input': 3, 'output': 4}, 'turns': 2}},
                 {'key': 'shipping', 'startedAt': 400, 'endedAt': 500,
-                 'result': {'runnerSessionId': 's3', 'usage': {'input': 5, 'output': 6}}},
+                 'result': {'runnerSessionId': 's3', 'usage': {'input': 5, 'output': 6}, 'turns': 2}},
             ]}
             encoded = json.dumps(raw_children)
             subagent_prompt = build_prompt('triage', 'subagents', project_dir, deadline)
@@ -345,7 +414,7 @@ class LauncherChecks(unittest.TestCase):
             )
             self.assertNotIn('\"model\":', subagent_script)
             self.assertEqual(subagent_script.count('\"async\":false'), 3)
-            self.assertEqual(subagent_script.count('\"acceptance\":{\"level\":\"none\",\"reason\":\"Read-only benchmark output is checked by the parent grader\"}'), 3)
+            self.assertEqual(subagent_script.count('\"acceptance\":{\"level\":\"none\",\"reason\":\"Benchmark output is checked by the parent grader\"}'), 3)
             subagent_events = [
                 {'type': 'tool_execution_start', 'toolCallId': 'enable',
                  'toolName': 'subagents_enable', 'args': {}},
@@ -430,6 +499,7 @@ class LauncherChecks(unittest.TestCase):
                 'fabric', fabric_event, 'triage', project_dir, deadline)['verified'])
             fabric_children = extract_children(fabric_event, arm='fabric')
             self.assertEqual(len(fabric_children), 3)
+            self.assertEqual([child['turns'] for child in fabric_children], [2, 2, 2])
             self.assertTrue(overlap_summary(fabric_children)['evidenced'])
             self.assertTrue(all(child['usage']['known'] for child in fabric_children))
             self.assertEqual(extract_children([fabric_event[1]], arm='fabric'), [])
@@ -471,7 +541,7 @@ class LauncherChecks(unittest.TestCase):
                     'acceptance': {'status': 'none'},
                     'model': 'openai/gpt-6-sol', 'thinking': 'xhigh',
                     'usage': {'input': 10 + index, 'output': 5, 'cacheRead': 0,
-                              'cacheWrite': 0, 'cost': 0.001, 'turns': 2},
+                              'cacheWrite': 0, 'cost': 0.001, 'turns': 2 if index == 0 else None},
                 })
             workflow_result = {
                 'content': [{'type': 'text', 'text': 'Workflow complete.\n\nReturn:\n' +
@@ -501,6 +571,7 @@ class LauncherChecks(unittest.TestCase):
                 'subagents', events, 'triage', project_dir, deadline)['verified'])
             records = extract_children(events, 'subagents', session_dir)
             self.assertEqual(len(records), 3)
+            self.assertEqual([record['turns'] for record in records], [2, 1, 1])
             self.assertTrue(overlap_summary(records)['evidenced'])
             self.assertTrue(all(record['usage']['known'] for record in records))
             failed_events = list(events)
@@ -709,10 +780,12 @@ class ReportingChecks(unittest.TestCase):
             cell('subagents', 2, 'failed', 400, unknown,
                  {'evidenced': False, 'interval_count': None, 'max_concurrency': None},
                  ['bad | <script>']),
-        ], repetitions=2, cases=['triage'], arms=['stock', 'subagents', 'fabric'])
+            cell('tintin-subagents', 1, 'passed', 600, known,
+                 {'evidenced': True, 'interval_count': 3, 'max_concurrency': 3}),
+        ], repetitions=2, cases=['triage'], arms=ARMS)
         markdown = render_markdown(result)
 
-        self.assertIn('4/6 recorded; 3 passed; 1 failed; 2 not run', markdown)
+        self.assertIn('5/8 recorded; 4 passed; 1 failed; 3 not run', markdown)
         self.assertIn('1/2 | 1 | 0 | 50.0% | 500.0 ms', markdown)
         self.assertIn('2.00× (n=1)', markdown)
         self.assertIn('Unknown (1/2 cells known)', markdown)
@@ -720,6 +793,7 @@ class ReportingChecks(unittest.TestCase):
         self.assertIn('| 2 | subagents | failed | no | 400.0 ms | Unknown |', markdown)
         self.assertIn(r'bad \| &lt;script&gt;', markdown)
         self.assertNotIn('<script>', markdown)
+        self.assertIn('| tintin-subagents | 1/2 | 0 | 1 |', markdown)
         self.assertIn('| fabric | 0/2 | 0 | 2 |', markdown)
 
     def test_missing_usage_is_unknown_not_zero(self):
@@ -873,10 +947,10 @@ class ReportingChecks(unittest.TestCase):
             report = json.loads(output.getvalue())
             manifest = json.loads((Path(report['run_dir']) / 'run.json').read_text())
             self.assertEqual(status, 1)
-            self.assertEqual(len(attempts), 3)
+            self.assertEqual(len(attempts), 4)
             self.assertEqual(manifest['state'], 'smoke_failed')
-            self.assertEqual(report['planned_cells'], 18)
-            self.assertEqual(len(report['missing_cells']), 15)
+            self.assertEqual(report['planned_cells'], 60)
+            self.assertEqual(len(report['missing_cells']), 56)
 
     def test_matrix_interrupt_saves_cell_and_report_without_later_attempts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -905,7 +979,7 @@ class ReportingChecks(unittest.TestCase):
             self.assertEqual(len(attempts), 2)
             self.assertEqual(manifest['state'], 'interrupted')
             self.assertEqual(report['state'], 'interrupted')
-            self.assertEqual(len(report['missing_cells']), 16)
+            self.assertEqual(len(report['missing_cells']), 58)
             self.assertEqual(interrupted['answer'], 'partial or final answer')
             self.assertEqual(interrupted['elapsed_ms'], 100)
             self.assertEqual(interrupted['termination_reason'], 'interrupted')
@@ -932,32 +1006,39 @@ class ReportingChecks(unittest.TestCase):
             'status': 'passed', 'correct': True, 'elapsed_ms': 10,
             'usage': {
                 'known': True, 'total_tokens': 18, 'cost_usd': 0.02,
-                'parent': {'input_tokens': 10, 'output_tokens': 2, 'total_tokens': 12},
-                'children': {'input_tokens': 5, 'output_tokens': 1, 'total_tokens': 6},
+                'parent': {'input_tokens': 10, 'output_tokens': 2, 'total_tokens': 12,
+                           'cache_read_tokens': 3, 'cache_write_tokens': 1},
+                'children': {'input_tokens': 5, 'output_tokens': 1, 'total_tokens': 6,
+                             'cache_read_tokens': 5, 'cache_write_tokens': 2},
             },
         }], repetitions=1, cases=['triage'], arms=['subagents'])
         usage = result['cases']['triage']['arms']['subagents']['usage']
         self.assertEqual(usage['input_tokens'], 15)
         self.assertEqual(usage['output_tokens'], 3)
         self.assertEqual(usage['total_tokens'], 18)
+        self.assertEqual(usage['cache_read_tokens'], 8)
+        self.assertEqual(usage['cache_write_tokens'], 3)
         self.assertEqual(usage['cost_usd'], 0.02)
 
     def test_three_repetition_matrix_is_complete_and_rotates_arms(self):
         schedule = matrix_schedule(['triage', 'patch'], 3)
-        self.assertEqual(len(schedule), 18)
-        self.assertEqual(len(set(schedule)), 18)
-        self.assertEqual(schedule[:3], [
+        self.assertEqual(len(schedule), 24)
+        self.assertEqual(len(set(schedule)), 24)
+        self.assertEqual(schedule[:4], [
             ('triage', 'stock', 1),
             ('triage', 'subagents', 1),
+            ('triage', 'tintin-subagents', 1),
             ('triage', 'fabric', 1),
         ])
-        self.assertEqual(schedule[3:6], [
+        self.assertEqual(schedule[4:8], [
             ('patch', 'subagents', 1),
+            ('patch', 'tintin-subagents', 1),
             ('patch', 'fabric', 1),
             ('patch', 'stock', 1),
         ])
-        self.assertEqual(schedule[6:9], [
+        self.assertEqual(schedule[8:12], [
             ('triage', 'subagents', 2),
+            ('triage', 'tintin-subagents', 2),
             ('triage', 'fabric', 2),
             ('triage', 'stock', 2),
         ])

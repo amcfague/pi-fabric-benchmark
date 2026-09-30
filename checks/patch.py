@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 
-def verify(project_dir: str | Path) -> dict[str, object]:
+def verify(project_dir: str | Path, integration: bool = False) -> dict[str, object]:
     """Run direct boundary and cross-module checks against a patched copy."""
     root = Path(project_dir).resolve()
     names = ("catalog", "billing", "shipping")
@@ -35,16 +35,21 @@ def verify(project_dir: str | Path) -> dict[str, object]:
         check("zero quantity is free", billing.subtotal_cents(1250, 0), 0)
         check("free shipping includes threshold", shipping.shipping_fee_cents(5000), 0)
         check("below threshold pays standard fee", shipping.shipping_fee_cents(4999), 599)
-        check(
-            "checkout integration",
-            shipping.quote_order(11, 4, 1250, 4),
-            {
-                "available_units": 7,
-                "order_fulfillable": True,
-                "subtotal_cents": 5000,
-                "shipping_fee_cents": 0,
-            },
-        )
+        expected_quote = {
+            "available_units": 7,
+            "order_fulfillable": True,
+            "subtotal_cents": 5000,
+            "shipping_fee_cents": 0,
+        }
+        if integration:
+            expected_quote["grand_total_cents"] = 5000
+        check("checkout integration", shipping.quote_order(11, 4, 1250, 4), expected_quote)
+        if integration:
+            check(
+                "grand total includes below-threshold shipping",
+                shipping.quote_order(11, 4, 1250, 1).get("grand_total_cents"),
+                1849,
+            )
     except Exception as exc:
         errors.append(f"fixture check failed to execute: {type(exc).__name__}: {exc}")
     finally:
@@ -62,9 +67,10 @@ def verify(project_dir: str | Path) -> dict[str, object]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--integration", action="store_true")
     parser.add_argument("project_dir", type=Path)
     args = parser.parse_args()
-    result = verify(args.project_dir)
+    result = verify(args.project_dir, integration=args.integration)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["passed"] else 1
 
