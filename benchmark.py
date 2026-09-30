@@ -32,10 +32,12 @@ CORE_TOOLS = ("read", "grep", "find", "ls", "bash", "edit", "write")
 ARMS = ("stock", "subagents", "tintin-subagents", "fabric")
 ARM_EXTENSION_TOOLS = {
     "subagents": ("subagents_enable", "subagent"),
-    "tintin-subagents": ("Agent",),
+    "tintin-subagents": ("Agent", "get_subagent_result"),
     "fabric": ("fabric_exec",),
 }
 CASES = ("triage", "patch", "control", "debug", "integration")
+STRESS_CASES = ("integration-contention",)
+CASE_VERSION = 2
 PINS = {
     "subagents": {
         "name": "pi-subagents", "version": "0.73.1",
@@ -50,6 +52,10 @@ PINS = {
         "integrity": "sha512-tW1DBe8cZYN91yezHHud5R3nLCV8LU2/1rS69f9u0LnsuuDXBVpxbEa06o2sbiJuANMxIJ1PGf+2wGXdGWqAmg==",
     },
 }
+FABRIC_OFFLINE_BLOCK_REASON = (
+    f"{PINS['fabric']['name']}@{PINS['fabric']['version']} offline child did not exit "
+    "after stdin closed for 5000ms"
+)
 HOST_RUNTIME_ARMS = ("subagents", "tintin-subagents")
 SUBAGENT_RUNTIME_PIN = {
     "name": "@earendil-works/pi-coding-agent", "version": "0.87.1",
@@ -162,6 +168,36 @@ def inspect_host_runtime(cache_root: Path, package_arm: str) -> dict[str, Any]:
     }
 
 
+def scripted_ai_runtime(cache_root: Path, arm: str) -> dict[str, Any]:
+    if arm not in PINS:
+        raise ValueError(f"unknown arm: {arm}")
+    prefix = cache_root / "packages" / arm
+    lock = json.loads((prefix / "package-lock.json").read_text())
+    paths = (
+        "node_modules/@earendil-works/pi-ai",
+        "node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai",
+    )
+    for relative in paths:
+        root = (prefix / relative).resolve()
+        metadata_path = root / "package.json"
+        if not metadata_path.is_file():
+            continue
+        pinned = lock.get("packages", {}).get(relative, {})
+        metadata = json.loads(metadata_path.read_text())
+        if (metadata.get("name") != "@earendil-works/pi-ai"
+                or not pinned.get("version") or metadata.get("version") != pinned["version"]
+                or not root.is_relative_to(prefix.resolve())):
+            raise ValueError(f"scripted AI runtime differs from the {arm} lockfile")
+        entry = (root / "dist" / "index.js").resolve()
+        if not entry.is_file() or not entry.is_relative_to(root):
+            raise ValueError(f"invalid scripted AI runtime entry for {arm}")
+        return {
+            "entry": str(entry), "root": str(root), "version": metadata["version"],
+            "integrity": pinned.get("integrity"), "sha256": tree_sha256(root),
+        }
+    raise FileNotFoundError(f"scripted AI runtime is not installed for {arm}")
+
+
 def install_packages(cache_root: Path) -> dict[str, Any]:
     private_dir(cache_root)
     installed = {}
@@ -233,9 +269,39 @@ def build_command(
     return command
 
 
+def build_scripted_command(
+    arm: str, session_dir: str | Path, extension_paths: dict[str, str | Path],
+    pi_binary: str = PI_BINARY,
+) -> list[str]:
+    if arm not in PINS:
+        raise ValueError(f"unknown scripted arm: {arm}")
+    entry = Path(extension_paths[arm])
+    if not entry.is_absolute():
+        raise ValueError(f"extension path must be absolute: {entry}")
+    return [
+        pi_binary, "--mode", "rpc", "--provider", "benchmark-driver", "--model", "scripted",
+        "--thinking", "off", "--session-dir", str(session_dir),
+        "--tools", ",".join(ARM_EXTENSION_TOOLS[arm]), "--no-extensions",
+        "-e", str(entry), "-e", str(ROOT / "scripted-provider.ts"),
+        "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve",
+    ]
+
+
+def build_synthesis_command(
+    prompt: str, session_dir: str | Path, pi_binary: str = PI_BINARY,
+) -> list[str]:
+    return [
+        pi_binary, "--mode", "json", "--provider", PROVIDER, "--model", MODEL,
+        "--thinking", THINKING, "--session-dir", str(session_dir),
+        "--no-tools", "--no-extensions", "--no-skills", "--no-prompt-templates",
+        "--no-themes", "--no-context-files", "--no-approve", "--print", prompt,
+    ]
+
+
 def build_environment(
     cell_dir: Path, source: dict[str, str] | None = None,
     pi_binary: str = PI_BINARY, subagents_runtime_root: str | Path | None = None,
+    subagents_worker_model: str | None = None,
 ) -> dict[str, str]:
     source = os.environ if source is None else source
     allowed = (
@@ -253,7 +319,10 @@ def build_environment(
     env["PI_FABRIC_PI_BINARY"] = pi_binary
     if subagents_runtime_root is not None:
         _write_json(agent_dir / "settings.json", {
-            "subagents": {"agentOverrides": {"worker": {"thinking": THINKING}}},
+            "subagents": {"agentOverrides": {"worker": {
+                "thinking": THINKING,
+                **({"model": subagents_worker_model} if subagents_worker_model else {}),
+            }}},
         })
         env["PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT"] = str(Path(subagents_runtime_root).resolve())
     validate_pi_binary(pi_binary, env)
@@ -270,8 +339,8 @@ def _child_tasks(case: str, project_dir: Path) -> list[dict[str, str]]:
                 "observed_cents and required_cents. Do not edit files."
             ),
         }]
-    if case == "integration":
-        return [
+    if case in ("integration", *STRESS_CASES):
+        tasks = [
             {"key": "catalog", "task": (
                 f"Modify only catalog.py in {project_dir}. Fix inventory to subtract "
                 "reservations and clamp at zero. Preserve its public API."
@@ -280,16 +349,26 @@ def _child_tasks(case: str, project_dir: Path) -> list[dict[str, str]]:
                 f"Modify only billing.py in {project_dir}. Fix subtotal to multiply "
                 "integer unit-price cents by quantity. Preserve its public API."
             )},
-            {"key": "shipping-fee", "task": (
-                f"Modify only shipping_fee_cents in shipping.py in {project_dir}. "
-                "Waive shipping at and above the free threshold; preserve quote_order."
-            )},
-            {"key": "checkout-total", "task": (
-                f"Modify only quote_order in shipping.py in {project_dir}. Add "
-                "grand_total_cents as subtotal plus shipping fee; preserve existing keys "
-                "and shipping_fee_cents."
-            )},
         ]
+        if case == "integration":
+            tasks.append({"key": "shipping", "task": (
+                f"Modify only shipping.py in {project_dir}. Waive shipping at and above "
+                "the free threshold in shipping_fee_cents; add grand_total_cents to "
+                "quote_order as subtotal plus shipping fee, preserving all existing keys."
+            )})
+        else:
+            tasks.extend([
+                {"key": "shipping-fee", "task": (
+                    f"Modify only shipping_fee_cents in shipping.py in {project_dir}. "
+                    "Waive shipping at and above the free threshold; preserve quote_order."
+                )},
+                {"key": "checkout-total", "task": (
+                    f"Modify only quote_order in shipping.py in {project_dir}. Add "
+                    "grand_total_cents as subtotal plus shipping fee; preserve existing keys "
+                    "and shipping_fee_cents."
+                )},
+            ])
+        return tasks
     files = ("catalog.py", "billing.py", "shipping.py")
     tasks = []
     for filename in files:
@@ -321,27 +400,69 @@ def _child_tasks(case: str, project_dir: Path) -> list[dict[str, str]]:
                     "billing": "test_subtotal_multiplies_unit_cents",
                     "shipping": "test_free_shipping_includes_threshold",
                 }[module]
-                task += f" Read test_contracts.py and fix the cause of {test}; do not edit tests."
+                task += (f" Read test_contracts.py and debug-precheck.txt in {project_dir}; "
+                         f"fix the cause of {test} without editing tests.")
         tasks.append({"key": module, "task": task})
     return tasks
 
 
-def _fabric_script(tasks: list[dict[str, str]], project_dir: Path, child_timeout: int) -> str:
+def _fabric_script(
+    tasks: list[dict[str, str]], project_dir: Path, child_timeout: int, stress: bool = False,
+) -> str:
     specs = [{"key": task["key"], "task": task["task"]} for task in tasks]
+    audit = (
+        "  const stressEdits = [];\n"
+        "  if (spec.key === 'shipping-fee' || spec.key === 'checkout-total') {\n"
+        "    let page = await agents.log({ id: result.id, type: 'run', lines: 500 });\n"
+        "    const entries = [...page.events];\n"
+        "    while (page.hasMore && typeof page.before === 'number') {\n"
+        "      const before = page.before;\n"
+        "      page = await agents.log({ id: result.id, type: 'run', lines: 500, before });\n"
+        "      if (page.hasMore && page.before === before) throw new Error('Fabric log cursor stalled');\n"
+        "      entries.push(...page.events);\n"
+        "    }\n"
+        "    if (!page.hasMore) {\n"
+        "      const starts = new Map();\n"
+        "      for (const line of entries.sort((a, b) => a.offset - b.offset)) {\n"
+        "        const event = line.parsed;\n"
+        "        if (!event || (event.toolName !== 'edit' && event.toolName !== 'write')) continue;\n"
+        "        if (event.type === 'tool_execution_start' && typeof event.args?.path === 'string')\n"
+        "          starts.set(event.toolCallId, { tool: event.toolName, path: event.args.path });\n"
+        "        if (event.type === 'tool_execution_end' && event.isError === false && starts.has(event.toolCallId))\n"
+        "          stressEdits.push(starts.get(event.toolCallId));\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+    ) if stress else ""
     return (
         "const specs = " + json.dumps(specs, separators=(",", ":")) + ";\n"
         "const children = await Promise.all(specs.map(async (spec) => {\n"
-        "  const startedAt = Date.now();\n"
         "  const result = await agents.run({\n"
         f"    name: 'benchmark-' + spec.key, task: spec.task, runner: 'pi', model: '{PROVIDER}/{MODEL}', thinking: '{THINKING}',\n"
         f"    tools: {json.dumps(list(CORE_TOOLS))}, extensions: false, recursive: false,\n"
         f"    cwd: {json.dumps(str(project_dir))}, worktree: false, timeoutMs: {child_timeout},\n"
-        "  });\n"
-        "  return { key: spec.key, startedAt, endedAt: Date.now(), result: {\n"
-        "    id: result.id, status: result.status, text: result.text, usage: result.usage,\n"
-        "    turns: result.turns, toolCalls: result.toolCalls, runnerSessionId: result.runnerSessionId,\n"
-        "  }};\n}));\n"
+        "  });\n" + audit
+        + "  return { key: spec.key, startedAt: result.startedAt, endedAt: result.finishedAt, result: {\n"
+        "    id: result.id, status: result.status, error: result.error,\n"
+        "    model: result.model, thinking: result.thinking,\n"        "    text: result.text, usage: result.usage, turns: result.turns,\n"
+        "    toolCalls: result.toolCalls, runnerSessionId: result.runnerSessionId,\n"
+        + ("    stressEdits,\n" if stress else "")
+        + "  }};\n}));\n"
         "console.log(JSON.stringify({ children }));\nreturn { children };"
+    )
+
+
+def _subagents_script(tasks: list[dict[str, str]], project_dir: Path, child_timeout: int) -> str:
+    children = [{
+        "key": task["key"], "agent": "worker", "task": task["task"],
+        "async": False, "tools": ",".join(CORE_TOOLS), "extensions": [], "skills": [],
+        "acceptance": {"level": "none", "reason": "Benchmark output is checked by the parent grader"},
+        "context": "fresh", "cwd": str(project_dir), "worktree": False,
+        "timeoutMs": child_timeout,
+    } for task in tasks]
+    return (
+        "const children = " + json.dumps(children, separators=(",", ":")) + ";\n"
+        "const results = await runs.all(children);\nconsole.log(JSON.stringify({ children: results }));\nreturn { children: results };"
     )
 
 
@@ -350,16 +471,48 @@ def _tintin_agent_specs(tasks: list[dict[str, str]]) -> list[dict[str, Any]]:
         "prompt": task["task"], "description": f"Handle {task['key']} task",
         "name": task["key"], "subagent_type": "general-purpose",
         "model": f"{PROVIDER}/{MODEL}", "thinking": THINKING, "max_turns": 10,
-        "run_in_background": False, "isolated": True, "inherit_context": False,
+        "run_in_background": True, "isolated": True, "inherit_context": False,
         "isolation": "off",
     } for task in tasks]
 
 
+def _scripted_spec(case: str, arm: str, project_dir: Path, deadline_seconds: int) -> dict[str, Any]:
+    if case not in (*CASES, *STRESS_CASES) or arm not in PINS:
+        raise ValueError("unknown scripted case or arm")
+    tasks = _child_tasks(case, project_dir)
+    child_timeout = deadline_seconds * 1000
+    if arm == "subagents":
+        stages = [
+            {"calls": [{"id": "bench-enable", "name": "subagents_enable", "arguments": {}}]},
+            {"calls": [{"id": "bench-list", "name": "subagent", "arguments":
+                        {"action": "list", "capabilities": True}}]},
+            {"calls": [{"id": "bench-workflow", "name": "subagent", "arguments": {
+                "workflowScript": _subagents_script(tasks, project_dir, child_timeout),
+                "cwd": str(project_dir), "async": False, "timeoutMs": child_timeout, "mission": False,
+            }}]},
+        ]
+    elif arm == "tintin-subagents":
+        specs = _tintin_agent_specs(tasks)
+        stages = [
+            {"calls": [{"id": f"bench-launch-{spec['name']}", "name": "Agent", "arguments": spec}
+                       for spec in specs]},
+            {"collect": [{"id": f"bench-result-{spec['name']}",
+                          "launchId": f"bench-launch-{spec['name']}"} for spec in specs]},
+        ]
+    else:
+        stages = [{"calls": [{"id": "bench-fabric", "name": "fabric_exec", "arguments":
+                              {"code": _fabric_script(tasks, project_dir, child_timeout,
+                                                      stress=case in STRESS_CASES)}}]}]
+    return {"version": 1, "arm": arm, "stages": stages}
+
+
 def build_prompt(case: str, arm: str, project_dir: Path, deadline_seconds: int = DEFAULT_DEADLINE) -> str:
-    if case not in CASES or arm not in ARMS:
+    if case not in (*CASES, *STRESS_CASES) or arm not in ARMS:
         raise ValueError("unknown case or arm")
     case_text = (ROOT / "cases" / f"{case}.md").read_text()
     base = f"{case_text}\n\nThe writable fixture is {project_dir}. Use no files outside it."
+    if case == "debug":
+        base += f"\n\nInitial contract-test output: {project_dir / 'debug-precheck.txt'}"
     if arm == "stock":
         return base
     tasks = _child_tasks(case, project_dir)
@@ -369,23 +522,7 @@ def build_prompt(case: str, arm: str, project_dir: Path, deadline_seconds: int =
     delegation_mode = "in parallel" if task_count > 1 else "as one delegated child"
     child_timeout = deadline_seconds * 1000
     if arm == "subagents":
-        children = [
-            {
-                "key": task["key"], "agent": "worker", "task": task["task"],
-                "async": False, "tools": ",".join(CORE_TOOLS), "extensions": [], "skills": [],
-                "acceptance": {
-                    "level": "none",
-                    "reason": "Benchmark output is checked by the parent grader",
-                },
-                "context": "fresh", "cwd": str(project_dir), "worktree": False,
-                "timeoutMs": child_timeout,
-            }
-            for task in tasks
-        ]
-        script = (
-            "const children = " + json.dumps(children, separators=(",", ":")) + ";\n"
-            "const results = await runs.all(children);\nconsole.log(JSON.stringify({ children: results }));\nreturn { children: results };"
-        )
+        script = _subagents_script(tasks, project_dir, child_timeout)
         return (
             base + f"\n\nDelegate exactly {task_description} {delegation_mode}; child cap is {task_count}. "
             "Use the pi-subagents workflow, never another runtime. Call subagents_enable first, "
@@ -401,14 +538,15 @@ def build_prompt(case: str, arm: str, project_dir: Path, deadline_seconds: int =
         return (
             base + f"\n\nDelegate exactly {task_description} {delegation_mode}; child cap is {task_count}. "
             "Use the loaded Agent tool from @tintinweb/pi-subagents, not the other subagents package. "
-            "Emit all Agent calls in one assistant message, without waiting between siblings; Pi runs that tool-call batch concurrently. "
-            "Keep run_in_background false and collect inline results after the batch settles. Do not use workflows, "
-            "background agents, or any other tools. The isolated general-purpose agents "
+            "Launch every Agent below with run_in_background true before collecting any result. "
+            "Each Agent call returns an ID immediately; issue the next launch without waiting for completion. "
+            "After all launches, call get_subagent_result with agent_id set to each returned ID and wait:true "
+            "exactly once per child. Do not use workflows or any other tools. The isolated general-purpose agents "
             "have only built-in tools and fresh context. Set model, thinking, and max_turns exactly as shown. "
-            "Use only child results; do not inspect fixture files in the parent. Synthesize after all children finish.\n\n"
+            "Use only completed child results; do not inspect fixture files in the parent. Synthesize after all children finish.\n\n"
             "Agent arguments = " + json.dumps(_tintin_agent_specs(tasks), indent=2)
         )
-    script = _fabric_script(tasks, project_dir, child_timeout)
+    script = _fabric_script(tasks, project_dir, child_timeout, stress=case in STRESS_CASES)
     return (
         base + f"\n\nDelegate exactly {task_description} {delegation_mode}; child cap is {task_count}. "
         "Call the loaded fabric_exec tool once with the following TypeScript. Do not perform the "
@@ -419,23 +557,24 @@ def build_prompt(case: str, arm: str, project_dir: Path, deadline_seconds: int =
     )
 
 
-def _pump(
-    stream: Any, path: Path, tool_call_times: dict[str, dict[str, float]] | None = None,
-    observed_tools: tuple[str, ...] = (),
-) -> None:
+def build_synthesis_prompt(case: str, project_dir: Path, children: list[dict[str, Any]]) -> str:
+    keys = [task["key"] for task in _child_tasks(case, project_dir)]
+    outputs = {child.get("key"): child.get("output") for child in children}
+    if (len(children) != len(keys) or set(outputs) != set(keys)
+            or any(not isinstance(outputs[key], str) or not outputs[key].strip() for key in keys)):
+        raise ValueError("scripted synthesis requires every completed child output")
+    case_text = (ROOT / "cases" / f"{case}.md").read_text()
+    return (
+        case_text + "\n\nThe children completed the fixture work below. "
+        "Do not inspect or modify files or call tools. Synthesize only from these results; "
+        "the benchmark runs external checks separately.\n\n"
+        + json.dumps({key: outputs[key] for key in keys}, indent=2)
+    )
+
+
+def _pump(stream: Any, path: Path) -> None:
     with path.open("wb") as output:
         for line in iter(stream.readline, b""):
-            if tool_call_times is not None and observed_tools:
-                try:
-                    event = json.loads(line)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    event = {}
-                kind = event.get("type", event.get("event"))
-                call_id = event.get("toolCallId")
-                if (event.get("toolName") in observed_tools and isinstance(call_id, str)
-                        and kind in ("tool_execution_start", "tool_execution_end")):
-                    field = "start" if kind == "tool_execution_start" else "end"
-                    tool_call_times.setdefault(call_id, {})[field] = time.monotonic() * 1000
             output.write(line)
             output.flush()
 
@@ -464,7 +603,6 @@ def _terminate_process(process: subprocess.Popen, grace_seconds: float) -> None:
 def run_process(
     command: list[str], cwd: Path, env: dict[str, str], event_path: Path, stderr_path: Path,
     deadline_seconds: float, terminate_grace_seconds: float = 3.0,
-    observed_tools: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     event_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
@@ -473,10 +611,7 @@ def run_process(
         command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=(os.name == "posix"),
     )
-    tool_call_times: dict[str, dict[str, float]] = {}
-    stdout_thread = threading.Thread(
-        target=_pump, args=(process.stdout, event_path, tool_call_times, observed_tools), daemon=True,
-    )
+    stdout_thread = threading.Thread(target=_pump, args=(process.stdout, event_path), daemon=True)
     stderr_thread = threading.Thread(target=_pump, args=(process.stderr, stderr_path), daemon=True)
     stdout_thread.start()
     stderr_thread.start()
@@ -497,24 +632,101 @@ def run_process(
         "exit_code": process.returncode, "timed_out": timed_out, "interrupted": interrupted,
         "elapsed_ms": round((time.monotonic() - started) * 1000),
         "termination_reason": "interrupted" if interrupted else "deadline" if timed_out else "process_exit",
-        "tool_call_times": tool_call_times,
     }
 
 
-def read_events(path: Path) -> tuple[list[dict[str, Any]], int]:
-    events, malformed = [], 0
-    if not path.is_file():
-        return events, 0
-    for line in path.read_text(errors="replace").splitlines():
-        if line == "[mcporter] stderr from headroom":
-            continue
+def run_rpc_process(
+    command: list[str], cwd: Path, env: dict[str, str], event_path: Path, stderr_path: Path,
+    deadline_seconds: float, prompt: str,
+) -> dict[str, Any]:
+    event_path.parent.mkdir(parents=True, exist_ok=True)
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    process = subprocess.Popen(
+        command, cwd=cwd, env=env, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=(os.name == "posix"),
+    )
+    settled = threading.Event()
+    finished = threading.Event()
+    accepted: bool | None = None
+
+    def pump_events() -> None:
+        nonlocal accepted
         try:
-            value = json.loads(line)
-            if isinstance(value, dict):
-                events.append(value)
-        except json.JSONDecodeError:
-            malformed += 1
-    return events, malformed
+            with event_path.open("wb") as output:
+                for line in iter(process.stdout.readline, b""):
+                    output.write(line)
+                    output.flush()
+                    try:
+                        event = json.loads(line)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if event.get("type") == "response" and event.get("id") == "benchmark-launch":
+                        accepted = event.get("success") is True
+                        if not accepted:
+                            finished.set()
+                    elif event.get("type") == "agent_settled":
+                        settled.set()
+                        finished.set()
+        finally:
+            finished.set()
+
+    stdout_thread = threading.Thread(target=pump_events, daemon=True)
+    stderr_thread = threading.Thread(target=_pump, args=(process.stderr, stderr_path), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    timed_out = interrupted = False
+    try:
+        process.stdin.write(json.dumps({"id": "benchmark-launch", "type": "prompt", "message": prompt}).encode() + b"\n")
+        process.stdin.flush()
+        if not finished.wait(timeout=max(0, deadline_seconds - (time.monotonic() - started))):
+            timed_out = True
+            _terminate_process(process, 3)
+        else:
+            process.stdin.close()
+            try:
+                process.wait(timeout=max(0, deadline_seconds - (time.monotonic() - started)))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _terminate_process(process, 3)
+    except KeyboardInterrupt:
+        interrupted = True
+        _terminate_process(process, 3)
+    finally:
+        if process.poll() is None:
+            _terminate_process(process, 3)
+        if process.stdin and not process.stdin.closed:
+            process.stdin.close()
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+        process.stdout.close()
+        process.stderr.close()
+    return {
+        "exit_code": process.returncode, "timed_out": timed_out, "interrupted": interrupted,
+        "elapsed_ms": round((time.monotonic() - started) * 1000),
+        "termination_reason": "interrupted" if interrupted else "deadline" if timed_out else "process_exit",
+        "settled": settled.is_set(), "accepted": accepted is True,
+    }
+
+
+def read_events(path: Path) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+    events, malformed, diagnostics = [], 0, {}
+    if not path.is_file():
+        return events, malformed, diagnostics
+    with path.open(encoding="utf-8", errors="replace", newline="\n") as stream:
+        for raw_line in stream:
+            line = raw_line.removesuffix("\n").removesuffix("\r")
+            if line in ("[mcporter] stderr from headroom", "[mcporter] stderr from serena"):
+                name = line.rsplit(" ", 1)[-1]
+                diagnostics[name] = diagnostics.get(name, 0) + 1
+                continue
+            try:
+                value = json.loads(line)
+                if isinstance(value, dict):
+                    events.append(value)
+            except json.JSONDecodeError:
+                malformed += 1
+    return events, malformed, diagnostics
 
 
 def _text(content: Any) -> str:
@@ -594,7 +806,14 @@ def parse_events(events: list[dict[str, Any]], exit_code: int | None) -> dict[st
                 usage_by_id[str(message.get("id", index))] = usage
     final = assistant_messages[-1] if assistant_messages else {}
     stop = final.get("stopReason", final.get("stop_reason"))
-    answer = _text(final.get("content"))
+    answer = ""
+    for message in reversed(assistant_messages):
+        if message.get("stopReason", message.get("stop_reason")) not in ("stop", "end_turn", "endTurn"):
+            continue
+        text = _text(message.get("content"))
+        if text.strip():
+            answer = text
+            break
     usage = _sum_usage(list(usage_by_id.values()))
     return {
         "settled": settled, "agent_end": agent_end, "final_stop_reason": stop,
@@ -672,9 +891,9 @@ def _trusted_session_file(value: Any, session_dir: Path) -> Path | None:
     return path if path.is_file() and path.is_relative_to(root) else None
 
 
-def _session_result(path: Path) -> dict[str, Any] | None:
+def _session_result(path: Path, include_name: bool = False) -> dict[str, Any] | None:
     started_at = ended_at = None
-    model = thinking = None
+    model = thinking = session_name = None
     output = ""
     turn_ids: set[str] = set()
     try:
@@ -691,6 +910,8 @@ def _session_result(path: Path) -> dict[str, Any] | None:
                         model = f"{provider}/{model_id}"
                 elif event.get("type") == "thinking_level_change":
                     thinking = event.get("thinkingLevel")
+                elif event.get("type") == "session_info":
+                    session_name = event.get("name")
                 if event.get("type") == "session" and started_at is None:
                     started_at = timestamp
                 message = event.get("message")
@@ -716,7 +937,8 @@ def _session_result(path: Path) -> dict[str, Any] | None:
         return None
     if started_at is None or ended_at is None or ended_at <= started_at or not output.strip():
         return None
-    return {"startedAt": started_at, "endedAt": ended_at, "output": output, "model": model, "thinking": thinking, "turns": len(turn_ids)}
+    return {"startedAt": started_at, "endedAt": ended_at, "output": output, "model": model, "thinking": thinking,
+            "turns": len(turn_ids), **({"sessionName": session_name} if include_name else {})}
 
 
 def _returned_session_files(events: list[dict[str, Any]], session_dir: Path) -> set[Path]:
@@ -777,7 +999,7 @@ def _subagents_child_records(result: Any, session_dir: Path) -> list[dict[str, A
             "id": identifier, "key": key,
             "agent": row.get("agent") or child.get("agent"),
             "runId": run_id, "state": "completed", "status": "completed",
-            **session,
+            "sessionFile": str(path), **session,
         }
         if isinstance(row.get("model"), str):
             item["extensionModel"] = row["model"]
@@ -795,47 +1017,54 @@ def _subagents_child_records(result: Any, session_dir: Path) -> list[dict[str, A
     return records
 
 
+def _tintin_records(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [entry["data"] for event in events
+            if event.get("type") == "entry_appended"
+            if isinstance(entry := event.get("entry"), dict)
+            and entry.get("type") == "custom" and entry.get("customType") == "subagents:record"
+            and isinstance(entry.get("data"), dict)]
+
+
 def extract_children(
     events: list[dict[str, Any]], arm: str, session_dir: Path | None = None,
-    tool_call_times: dict[str, dict[str, float]] | None = None,
 ) -> list[dict[str, Any]]:
     if arm not in ("subagents", "tintin-subagents", "fabric"):
         return []
     found: dict[str, dict[str, Any]] = {}
     if arm == "tintin-subagents":
+        if session_dir is None:
+            return []
+        sessions = {}
+        session_root = session_dir.parent / "agent" / "sessions"
+        for path in session_root.rglob("*.jsonl"):
+            trusted = _trusted_session_file(str(path), session_root)
+            session = _session_result(trusted, include_name=True) if trusted is not None else None
+            if session is not None and isinstance(name := session.pop("sessionName"), str):
+                session["sessionFile"] = str(trusted)
+                sessions[name] = session
+        records = {record.get("id"): record for record in _tintin_records(events)}
         for start, end in _completed_tool_calls(events, "Agent"):
             args, result = start.get("args"), end.get("result")
             details = result.get("details") if isinstance(result, dict) else None
             key = args.get("name") if isinstance(args, dict) else None
             identifier = details.get("agentId") if isinstance(details, dict) else None
             if (end.get("isError") is not False or not isinstance(key, str)
-                    or not isinstance(identifier, str) or details.get("status") != "completed"):
+                    or not isinstance(identifier, str) or details.get("status") != "background"):
                 continue
-            tags = details.get("tags")
-            thinking = next((tag.partition(": ")[2] for tag in tags
-                             if isinstance(tag, str) and tag.startswith("thinking: ")), None) \
-                if isinstance(tags, list) else None
-            item = {
-                "id": identifier, "key": key,
-                "agent": args.get("subagent_type"), "model": args.get("model"), "thinking": thinking,
-                "status": "completed", "state": "completed",
+            record = records.get(identifier)
+            session = sessions.get(f"general-purpose#{identifier[:8]}")
+            if (not isinstance(record, dict) or record.get("status") != "completed"
+                    or record.get("type") != "general-purpose"
+                    or not isinstance(record.get("result"), str) or not record["result"].strip()
+                    or not isinstance(session, dict)):
+                continue
+            found[key] = {
+                "id": identifier, "key": key, "agent": args.get("subagent_type"),
+                "status": record["status"], "state": record["status"],
+                "startedAt": record["startedAt"], "endedAt": record["completedAt"],
+                "model": session["model"], "thinking": session["thinking"], "turns": session["turns"],
+                "output": record["result"], "sessionFile": session["sessionFile"],
             }
-            call_id = start.get("toolCallId")
-            observed = tool_call_times.get(call_id, {}) if isinstance(tool_call_times, dict) else {}
-            started_at = _time_value(observed, "start") or _timestamp_ms(start.get("timestamp"))
-            ended_at = _time_value(observed, "end") or _timestamp_ms(end.get("timestamp"))
-            if started_at is not None and ended_at is not None and ended_at > started_at:
-                item.update({"startedAt": started_at, "endedAt": ended_at})
-            turns = _turn_number(details.get("turnCount"))
-            if turns is not None:
-                item["turns"] = turns
-            duration = _time_value(details, "durationMs")
-            if duration is not None:
-                item["durationMs"] = duration
-            usage = _usage_record(result.get("usage")) if isinstance(result, dict) else None
-            if usage is not None:
-                item["usage"] = usage
-            found[key] = item
         return list(found.values())
     if arm == "subagents":
         source_events = [
@@ -877,6 +1106,18 @@ def extract_children(
             if usage is not None:
                 item["usage"] = usage
             result = record.get("result")
+            if isinstance(result, dict):
+                if isinstance(result.get("status"), str):
+                    item["status"] = item["state"] = result["status"]
+                if isinstance(result.get("error"), str):
+                    item["error"] = result["error"]
+                if isinstance(result.get("text"), str) and result["text"].strip():
+                    item["output"] = result["text"]
+                for field in ("model", "thinking"):
+                    if isinstance(result.get(field), str):
+                        item[field] = result[field]
+                if isinstance(result.get("stressEdits"), list):
+                    item["stressEdits"] = result["stressEdits"]
             turns = _turn_number(record.get("turns"))
             if turns is None and isinstance(result, dict):
                 turns = _turn_number(result.get("turns"))
@@ -904,6 +1145,57 @@ def overlap_summary(children: list[dict[str, Any]]) -> dict[str, Any]:
         "max_concurrency": maximum if children else None,
         "evidenced": bool(children) and maximum >= 2,
     }
+
+
+def stress_edit_evidence(children: list[dict[str, Any]], project: Path) -> dict[str, Any]:
+    # ponytail: bash writes lack a native edit receipt; add file tracing if stress coverage needs them.
+    shipping = (project / "shipping.py").resolve()
+    attempts = []
+    for child in children:
+        if child.get("key") not in ("shipping-fee", "checkout-total"):
+            continue
+        for edit in child.get("stressEdits", []):
+            if (isinstance(edit, dict) and edit.get("tool") in ("edit", "write")
+                    and isinstance(edit.get("path"), str)):
+                target = Path(edit["path"])
+                if (target if target.is_absolute() else project / target).resolve() == shipping:
+                    attempts.append({"key": child["key"], "tool": edit["tool"],
+                                     "timestamp": edit.get("timestamp")})
+        session = _trusted_session_file(child.get("sessionFile"), project.parent)
+        if session is None:
+            continue
+        pending = {}
+        with session.open(encoding="utf-8", errors="replace", newline="\n") as entries:
+            for line in entries:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                message = event.get("message") if event.get("type") == "message" else None
+                if not isinstance(message, dict):
+                    continue
+                if message.get("role") == "assistant":
+                    for part in message.get("content", []):
+                        if not isinstance(part, dict) or part.get("type") != "toolCall":
+                            continue
+                        args = part.get("arguments")
+                        if (part.get("name") not in ("edit", "write") or not isinstance(args, dict)
+                                or not isinstance(args.get("path"), str)):
+                            continue
+                        target = Path(args["path"])
+                        if (target if target.is_absolute() else project / target).resolve() == shipping:
+                            pending[part.get("id")] = part["name"]
+                elif (message.get("role") == "toolResult" and message.get("isError") is False
+                      and message.get("toolCallId") in pending):
+                    attempts.append({"key": child["key"], "tool": pending.pop(message["toolCallId"]),
+                                     "timestamp": event.get("timestamp")})
+    shipping_children = [child for child in children
+                         if child.get("key") in ("shipping-fee", "checkout-total")]
+    verified = (len(shipping_children) == 2 and overlap_summary(shipping_children)["evidenced"]
+                and {"shipping-fee", "checkout-total"} <= {item["key"] for item in attempts})
+    return {"verified": verified, "attempts": attempts,
+            "reason": "both shipping owners edited during overlapping child runs" if verified
+                      else "same-file edit attempts are unverified"}
 
 
 def _tool_calls(events: list[dict[str, Any]]) -> list[tuple[str, Any]]:
@@ -937,6 +1229,7 @@ def _text_values(value: Any):
 
 def child_launch_evidence(
     arm: str, events: list[dict[str, Any]], case: str, project_dir: Path, deadline_seconds: int,
+    agent_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     calls = _tool_calls(events)
     expected_timeout = deadline_seconds * 1000
@@ -946,7 +1239,8 @@ def child_launch_evidence(
         pairs = _completed_tool_calls(events, "fabric_exec")
         args = starts[0].get("args") if len(starts) == 1 else None
         code = args.get("code") if isinstance(args, dict) else None
-        expected_code = _fabric_script(_child_tasks(case, project_dir), project_dir, expected_timeout)
+        expected_code = _fabric_script(_child_tasks(case, project_dir), project_dir,
+                                       expected_timeout, stress=case in STRESS_CASES)
         valid = (
             len(starts) == len(ends) == len(pairs) == 1
             and ends[0].get("isError") is False
@@ -959,49 +1253,77 @@ def child_launch_evidence(
     expected_cwd = re.escape(json.dumps(str(project_dir)))
     expected_tasks = _child_tasks(case, project_dir)
     if arm == "tintin-subagents":
-        expected_specs = {spec["name"]: spec for spec in _tintin_agent_specs(expected_tasks)}
-        starts = [
-            (index, event) for index, event in enumerate(events)
-            if event.get("type", event.get("event")) == "tool_execution_start"
-            and event.get("toolName") == "Agent"
-        ]
-        ends = [
-            (index, event) for index, event in enumerate(events)
-            if event.get("type", event.get("event")) == "tool_execution_end"
-            and event.get("toolName") == "Agent"
-        ]
+        expected_specs = {spec["name"]: spec for spec in
+                          (agent_specs if agent_specs is not None else _tintin_agent_specs(expected_tasks))}
+        starts = [(i, e) for i, e in enumerate(events) if e.get("type") == "tool_execution_start" and e.get("toolName") == "Agent"]
+        ends = [(i, e) for i, e in enumerate(events) if e.get("type") == "tool_execution_end" and e.get("toolName") == "Agent"]
+        results = [(i, e) for i, e in enumerate(events) if e.get("type") == "tool_execution_start" and e.get("toolName") == "get_subagent_result"]
+        result_ends = [e for e in events if e.get("type") == "tool_execution_end" and e.get("toolName") == "get_subagent_result"]
         pairs = _completed_tool_calls(events, "Agent")
-        starts_by_name = {
-            args.get("name"): args for _, event in starts
-            if isinstance((args := event.get("args")), dict)
-        }
+        result_pairs = _completed_tool_calls(events, "get_subagent_result")
+        starts_by_name = {args["name"]: args for _, e in starts
+                          if isinstance((args := e.get("args")), dict)
+                          and isinstance(args.get("name"), str)}
         schema_defaults = {"resume": "", "schedule": ""}
 
         def matches_spec(args: Any, spec: dict[str, Any]) -> bool:
+            return (isinstance(args, dict)
+                    and all(args.get(key) == value for key, value in spec.items())
+                    and all(key in spec or (key in schema_defaults and value == schema_defaults[key])
+                            for key, value in args.items()))
+
+        ids = {}
+        for start, end in pairs:
+            args, result = start.get("args"), end.get("result")
+            details = result.get("details") if isinstance(result, dict) else None
+            if (isinstance(args, dict) and isinstance(args.get("name"), str)
+                    and isinstance(details, dict) and end.get("isError") is False
+                    and details.get("status") == "background"
+                    and isinstance(details.get("agentId"), str) and details["agentId"].strip()):
+                ids[args["name"]] = details["agentId"]
+        records = _tintin_records(events)
+        by_id = {record["id"]: record for record in records
+                 if isinstance(record.get("id"), str)}
+        retrieved = {}
+        for start, end in result_pairs:
+            args, result = start.get("args"), end.get("result")
+            if (isinstance(args, dict) and set(args) <= {"agent_id", "wait", "verbose"}
+                    and isinstance(args.get("agent_id"), str) and args.get("wait") is True
+                    and args.get("verbose", False) is False
+                    and end.get("isError") is False and isinstance(result, dict)):
+                retrieved[args["agent_id"]] = _text(result.get("content"))
+
+        def retrieved_matches(identifier: str, description: str) -> bool:
+            text = retrieved.get(identifier, "")
+            lines = text.splitlines()
+            record = by_id.get(identifier)
             return (
-                isinstance(args, dict)
-                and all(args.get(key) == value for key, value in spec.items())
-                and all(key in spec or (key in schema_defaults and value == schema_defaults[key])
-                        for key, value in args.items())
+                len(lines) > 1 and lines[0] == f"Agent: {identifier}"
+                and " | Status: completed" in lines[1]
+                and f"Description: {description}" in text
+                and isinstance(record, dict) and isinstance(record.get("result"), str)
+                and bool(record["result"].strip()) and record["result"].strip() in text
             )
 
-        completed = all(
-            end.get("isError") is False
-            and isinstance(end.get("result"), dict)
-            and isinstance(end["result"].get("details"), dict)
-            and end["result"]["details"].get("status") == "completed"
-            for _, end in pairs
-        )
-        same_batch = bool(starts and ends) and max(i for i, _ in starts) < min(i for i, _ in ends)
         valid = (
             len(starts) == len(ends) == len(pairs) == len(expected_specs)
-            and len(starts_by_name) == len(expected_specs)
-            and all(matches_spec(starts_by_name.get(name), spec)
-                    for name, spec in expected_specs.items())
-            and completed and same_batch
-            and all(name == "Agent" for name, _ in calls)
+            and len(starts_by_name) == len(ids) == len(set(ids.values())) == len(expected_specs)
+            and all(matches_spec(starts_by_name.get(name), spec) for name, spec in expected_specs.items())
+            and len(results) == len(result_ends) == len(result_pairs) == len(retrieved) == len(expected_specs)
+            and bool(ends and results) and max(i for i, _ in ends) < min(i for i, _ in results)
+            and len(records) == len(by_id) == len(expected_specs)
+            and set(by_id) == set(retrieved) == set(ids.values())
+            and all(by_id[identifier].get("status") == "completed"
+                    and by_id[identifier].get("type") == "general-purpose"
+                    and by_id[identifier].get("description") == expected_specs[name]["description"]
+                    and (started := _time_value(by_id[identifier], "startedAt")) is not None
+                    and (ended := _time_value(by_id[identifier], "completedAt")) is not None
+                    and ended > started
+                    and retrieved_matches(identifier, expected_specs[name]["description"])
+                    for name, identifier in ids.items())
+            and all(name in ("Agent", "get_subagent_result") for name, _ in calls)
         )
-        reason = "verified foreground Agent calls ran in one parallel tool batch" if valid else "Tintin Agent launch or result collection is unverified"
+        reason = "verified background Agent launches and completed results" if valid else "Tintin Agent launch or result collection is unverified"
         return {"verified": valid, "tool_calls": [name for name, _ in calls], "reason": reason}
     if arm == "subagents":
         scripts = [" ".join(_text_values(args)) for name, args in calls if name == "subagent" and isinstance(args, dict) and isinstance(args.get("workflowScript"), str)]
@@ -1081,7 +1403,7 @@ def _grade(case: str, project: Path, answer: str) -> dict[str, Any]:
             from checks.control import verify
         return verify(parsed)
     command = [sys.executable, str(ROOT / "checks" / "patch.py")]
-    if case == "integration":
+    if case in ("integration", *STRESS_CASES):
         command.append("--integration")
     command.append(str(project))
     result = subprocess.run(command, capture_output=True, text=True, timeout=30)
@@ -1094,9 +1416,82 @@ def _grade(case: str, project: Path, answer: str) -> dict[str, Any]:
     return grade
 
 
-def preflight(cache_root: Path, pi_binary: str = PI_BINARY, source_env: dict[str, str] | None = None) -> dict[str, Any]:
+def _prove_scripted_capability(
+    arm: str, package: dict[str, Any], runtime: dict[str, Any],
+    pi_binary: str, source_env: dict[str, str],
+) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="pi-benchmark-capability-") as temporary:
+        cell = Path(temporary)
+        project = cell / "project"
+        shutil.copytree(ROOT / "fixtures" / "project", project)
+        session_dir = cell / "session"
+        env = build_environment(
+            cell, source_env, pi_binary,
+            subagents_runtime_root=package["host_runtime"]["root"] if arm == "subagents" else None,
+            subagents_worker_model="benchmark-driver/probe" if arm == "subagents" else None,
+        )
+        if arm == "subagents":
+            settings_path = Path(env["PI_CODING_AGENT_DIR"]) / "settings.json"
+            settings = json.loads(settings_path.read_text())
+            settings["subagents"]["agentOverrides"]["worker"]["thinking"] = "off"
+            _write_json(settings_path, settings)
+        else:
+            _write_json(Path(env["PI_CODING_AGENT_DIR"]) / "subagents.json", {
+                "reportUsage": True, "rememberAgents": True, "maxConcurrent": 1,
+            })
+        spec = _scripted_spec("control", arm, project, 20)
+        agent_specs = None
+        if arm == "tintin-subagents":
+            arguments = spec["stages"][0]["calls"][0]["arguments"]
+            arguments.update(model="benchmark-driver/probe", thinking="off", max_turns=3)
+            agent_specs = [arguments]
+        spec_path = cell / "scripted.json"
+        _write_json(spec_path, spec)
+        env.update({"PI_BENCHMARK_SCRIPTED_SPEC": str(spec_path),
+                    "PI_BENCHMARK_AI_ENTRY": runtime["entry"], "PI_OFFLINE": "1"})
+        command = build_scripted_command(arm, session_dir, {arm: package["entry"]}, pi_binary)
+        outcome = run_rpc_process(command, project, env, cell / "events.jsonl",
+                                  cell / "stderr.log", 30, "Run offline capability probe")
+        events, malformed, _ = read_events(cell / "events.jsonl")
+        if (outcome["exit_code"] != 0 or outcome["timed_out"] or outcome["interrupted"]
+                or not outcome["accepted"] or not outcome["settled"] or malformed
+                or not parse_events(events, outcome["exit_code"])["success"]):
+            raise RuntimeError("offline native dispatch did not settle cleanly")
+        launch = child_launch_evidence(arm, events, "control", project, 20, agent_specs)
+        if not launch["verified"]:
+            raise RuntimeError(launch["reason"])
+        children = extract_children(events, arm, session_dir)
+        if len(children) != 1:
+            raise RuntimeError("offline native child identity or session is missing")
+        child = children[0]
+        if (child.get("key") != "billing" or child.get("status") != "completed"
+                or child.get("model") != "benchmark-driver/probe" or child.get("thinking") != "off"
+                or child.get("output") != "benchmark probe complete"
+                or not isinstance(child.get("id"), str) or not child["id"]
+                or _trusted_session_file(child.get("sessionFile"), cell) is None):
+            raise RuntimeError("offline native child completion or settings are unverified")
+        if arm == "tintin-subagents":
+            joins = _completed_tool_calls(events, "get_subagent_result")
+            result = joins[0][1].get("result") if len(joins) == 1 else None
+            usage = _usage_record(result.get("usage")) if isinstance(result, dict) else None
+        else:
+            usage = child.get("usage")
+        if not isinstance(usage, dict) or not usage.get("known") or usage.get("total_tokens") != 2:
+            raise RuntimeError("offline native child usage receipt is missing")
+        return {"child_id": child["id"], "model": child["model"], "thinking": child["thinking"],
+                "synthetic_tokens": 2, "session_file_seen": True}
+
+
+def preflight(
+    cache_root: Path, pi_binary: str = PI_BINARY, source_env: dict[str, str] | None = None,
+    arms: tuple[str, ...] | None = None, scripted: bool = False,
+) -> dict[str, Any]:
     source_env = os.environ if source_env is None else source_env
-    errors = []
+    requested = tuple(PINS) if arms is None else tuple(dict.fromkeys(arms))
+    if any(arm not in PINS for arm in requested):
+        raise ValueError("unknown preflight arm")
+    errors: list[str] = []
+    global_errors: list[str] = []
     try:
         validate_pi_binary(pi_binary, dict(source_env))
         version = subprocess.run([pi_binary, "--version"], capture_output=True, text=True, timeout=20)
@@ -1109,20 +1504,22 @@ def preflight(cache_root: Path, pi_binary: str = PI_BINARY, source_env: dict[str
         pi_version = version.stdout.strip()
     except Exception as error:
         pi_version = None
-        errors.append(f"Pi wrapper preflight: {error}")
+        global_errors.append(f"Pi wrapper preflight: {error}")
     if pi_version and pi_version.splitlines()[-1].strip() != SUBAGENT_RUNTIME_PIN["version"]:
-        errors.append(
+        global_errors.append(
             f"Pi wrapper version does not match the pinned Pi host runtime "
             f"{SUBAGENT_RUNTIME_PIN['version']}"
         )
+    errors.extend(global_errors)
     packages = {}
-    manifest_path = cache_root / "package-manifest.json"
-    try:
-        manifest = json.loads(manifest_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        manifest = {"packages": {}}
-        errors.append("pinned package manifest is missing or invalid; run benchmark.py install")
-    for arm in PINS:
+    package_errors: dict[str, str] = {}
+    manifest = {"packages": {}}
+    if requested:
+        try:
+            manifest = json.loads((cache_root / "package-manifest.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            errors.append("pinned package manifest is missing or invalid; run benchmark.py install")
+    for arm in requested:
         try:
             actual = npm_integrity(f"{PINS[arm]['name']}@{PINS[arm]['version']}")
             if actual != PINS[arm]["integrity"]:
@@ -1153,9 +1550,31 @@ def preflight(cache_root: Path, pi_binary: str = PI_BINARY, source_env: dict[str
                 info["host_runtime"] = host_runtime
             packages[arm] = info
         except Exception as error:
-            errors.append(f"{arm} package preflight: {error}")
+            package_errors[arm] = f"{arm} package preflight: {error}"
+            errors.append(package_errors[arm])
+    capabilities = {}
+    if scripted:
+        for arm in requested:
+            if arm not in packages:
+                capabilities[arm] = {"verified": False, "reason": package_errors[arm]}
+                continue
+            try:
+                if not (ROOT / "scripted-provider.ts").is_file():
+                    raise FileNotFoundError("scripted provider is missing")
+                runtime = scripted_ai_runtime(cache_root, arm)
+                packages[arm]["scripted_runtime"] = runtime
+                if arm == "fabric":
+                    raise RuntimeError(FABRIC_OFFLINE_BLOCK_REASON)
+                proof = _prove_scripted_capability(arm, packages[arm], runtime, pi_binary, source_env)
+                capabilities[arm] = {"verified": True, "runtime": runtime, "proof": proof}
+            except Exception as error:
+                reason = f"{arm} scripted capability: {error}"
+                capabilities[arm] = {"verified": False, "reason": reason}
+                errors.append(reason)
     return {
-        "passed": not errors, "errors": errors, "pi_binary": pi_binary,
+        "passed": not errors, "global_passed": not global_errors,
+        "errors": errors, "package_errors": package_errors,
+        "scripted_capabilities": capabilities, "pi_binary": pi_binary,
         "pi_version": pi_version, "provider": PROVIDER, "model": MODEL,
         "thinking": THINKING, "package_info": packages,
         "model_connectivity": "verified by first live cell; no separate billable probe",
@@ -1198,7 +1617,10 @@ def run_cell(
     run_dir: Path, case: str, arm: str, repetition: int, deadline_seconds: int,
     packages: dict[str, dict[str, Any]], pi_binary: str = PI_BINARY,
     source_env: dict[str, str] | None = None,
+    orchestration: str = "model-directed", cache_root: Path | None = None,
 ) -> dict[str, Any]:
+    if orchestration not in ("model-directed", "scripted"):
+        raise ValueError(f"unknown orchestration: {orchestration}")
     cell_dir = run_dir / "cells" / f"{case}-{arm}-r{repetition:02d}"
     private_dir(cell_dir)
     project = cell_dir / "project"
@@ -1208,18 +1630,51 @@ def run_cell(
         packages.get("subagents", {}).get("host_runtime", {}).get("root")
         if arm == "subagents" else None
     )
+    scripted = orchestration == "scripted" and arm != "stock"
     env = build_environment(
         cell_dir, source_env, pi_binary, subagents_runtime_root=subagents_runtime_root,
+        subagents_worker_model=f"{PROVIDER}/{MODEL}" if scripted and arm == "subagents" else None,
     )
     if arm == "tintin-subagents":
-        _write_json(Path(env["PI_CODING_AGENT_DIR"]) / "subagents.json", {"reportUsage": True})
+        _write_json(Path(env["PI_CODING_AGENT_DIR"]) / "subagents.json", {
+            "reportUsage": True, "rememberAgents": True, "maxConcurrent": CHILD_CAP,
+        })
+    debug_precheck = None
+    if case == "debug":
+        check = subprocess.run(
+            [sys.executable, "-m", "unittest", "test_contracts"], cwd=project,
+            env={**env, "PYTHONDONTWRITEBYTECODE": "1"}, capture_output=True, text=True, timeout=30,
+        )
+        output = check.stdout + check.stderr
+        tests = ("test_available_units_subtracts_reservations",
+                 "test_subtotal_multiplies_unit_cents", "test_free_shipping_includes_threshold")
+        if check.returncode != 1 or any(f"FAIL: {test}" not in output for test in tests):
+            raise ValueError("debug fixture did not produce the expected failing contracts")
+        debug_precheck = project / "debug-precheck.txt"
+        _write_text(debug_precheck, output)
     package_paths = {key: value["entry"] for key, value in packages.items()}
-    prompt = build_prompt(case, arm, project, deadline_seconds)
-    command = build_command(arm, prompt, session_dir, package_paths, pi_binary)
+    scripted_runtime = ((packages[arm].get("scripted_runtime") or
+                         scripted_ai_runtime(cache_root or run_dir.parent.parent, arm))
+                        if scripted else None)
+    if scripted:
+        spec_path = cell_dir / "scripted.json"
+        _write_json(spec_path, _scripted_spec(case, arm, project, deadline_seconds))
+        env["PI_BENCHMARK_AI_ENTRY"] = scripted_runtime["entry"]
+        env["PI_BENCHMARK_SCRIPTED_SPEC"] = str(spec_path)
+        prompt = "Run the fixed benchmark child workset."
+        command = build_scripted_command(arm, session_dir, package_paths, pi_binary)
+    else:
+        prompt = build_prompt(case, arm, project, deadline_seconds)
+        command = build_command(arm, prompt, session_dir, package_paths, pi_binary)
     extension_args = [command[i + 1] for i, arg in enumerate(command[:-1]) if arg == "-e"]
     selected_tools = command[command.index("--tools") + 1].split(",")
-    expected_tools = list(CORE_TOOLS + ARM_EXTENSION_TOOLS.get(arm, ()))
-    if arm == "stock":
+    expected_tools = list(ARM_EXTENSION_TOOLS[arm] if scripted else CORE_TOOLS + ARM_EXTENSION_TOOLS.get(arm, ()))
+    if scripted:
+        parent_loadout_verified = (
+            selected_tools == expected_tools and "--no-extensions" in command
+            and extension_args == [package_paths[arm], str(ROOT / "scripted-provider.ts")]
+        )
+    elif arm == "stock":
         parent_loadout_verified = (
             selected_tools == expected_tools and "--no-extensions" in command and not extension_args
         )
@@ -1235,32 +1690,85 @@ def run_cell(
         "environment_keys": sorted(key for key in env if key.endswith("_API_KEY") or "proxy" in key.lower()),
         "child_binary": pi_binary,
     }
-    process_options = {"observed_tools": ("Agent",)} if arm == "tintin-subagents" else {}
-    result = run_process(
-        command, project, env, cell_dir / "events.jsonl", cell_dir / "stderr.log",
-        deadline_seconds, **process_options,
-    )
-    events, malformed = read_events(cell_dir / "events.jsonl")
-    agent = parse_events(events, result["exit_code"])
+    if scripted:
+        result = run_rpc_process(
+            command, project, env, cell_dir / "events.jsonl", cell_dir / "stderr.log",
+            deadline_seconds, prompt,
+        )
+    else:
+        result = run_process(
+            command, project, env, cell_dir / "events.jsonl", cell_dir / "stderr.log",
+            deadline_seconds,
+        )
+    events, malformed, event_diagnostics = read_events(cell_dir / "events.jsonl")
     launches = child_launch_evidence(arm, events, case, project, deadline_seconds)
-    children = extract_children(
-        events, arm=arm, session_dir=session_dir, tool_call_times=result.get("tool_call_times"),
-    ) if launches["verified"] else []
+    children = extract_children(events, arm=arm, session_dir=session_dir) if launches["verified"] else []
     expected_child_count = len(_child_tasks(case, project))
     child_runtime_matches_parent = (
         len(children) == expected_child_count and all(
             child.get("model") == f"{PROVIDER}/{MODEL}" and child.get("thinking") == THINKING
             for child in children
-        ) if arm in ("subagents", "tintin-subagents") else True
+        ) if arm != "stock" else True
     )
-    overlap = overlap_summary(children)
-    child_usage_records = [item["usage"] for item in children if isinstance(item.get("usage"), dict)]
+    if arm == "tintin-subagents":
+        # Tintin drains pooled child spend onto whichever tool returns next, not a specific child.
+        child_usage_records = [usage for name in ("Agent", "get_subagent_result")
+                               for _, end in _completed_tool_calls(events, name)
+                               if end.get("isError") is False
+                               and isinstance(end.get("result"), dict)
+                               if (usage := _usage_record(end["result"].get("usage"))) is not None]
+    else:
+        child_usage_records = [item["usage"] for item in children if isinstance(item.get("usage"), dict)]
     child_usage = _sum_usage(child_usage_records)
     if arm == "tintin-subagents":
-        # Tintin drains pooled child spend onto whichever Agent result completes next.
         child_usage["known"] = child_usage["known"] and len(children) == expected_child_count
     elif len(child_usage_records) != len(children):
         child_usage["known"] = False
+    dispatch_ok = not scripted
+    synthesis_attempted = False
+    if scripted:
+        dispatch = result
+        dispatch_ok = (dispatch["accepted"] and not dispatch["timed_out"]
+                       and parse_events(events, dispatch["exit_code"])["success"])
+        if (dispatch_ok and not malformed and launches["verified"]
+                and child_runtime_matches_parent and child_usage["known"]
+                and all(child.get("status") == "completed" for child in children)):
+            try:
+                synthesis_prompt = build_synthesis_prompt(case, project, children)
+            except ValueError:
+                synthesis_prompt = None
+            remaining = deadline_seconds - dispatch["elapsed_ms"] / 1000
+            if synthesis_prompt and remaining > 0:
+                synthesis_attempted = True
+                _write_text(cell_dir / "synthesis-prompt.txt", synthesis_prompt)
+                synthesis_command = build_synthesis_command(
+                    synthesis_prompt, session_dir / "synthesis", pi_binary,
+                )
+                _write_json(cell_dir / "synthesis-argv.json", synthesis_command)
+                synthesis = run_process(
+                    synthesis_command, project, env, cell_dir / "synthesis-events.jsonl",
+                    cell_dir / "synthesis-stderr.log", remaining,
+                )
+                synthesis_events, synthesis_malformed, synthesis_diagnostics = read_events(
+                    cell_dir / "synthesis-events.jsonl"
+                )
+                malformed += synthesis_malformed
+                for name, count in synthesis_diagnostics.items():
+                    event_diagnostics[name] = event_diagnostics.get(name, 0) + count
+                agent = parse_events(synthesis_events, synthesis["exit_code"])
+                result = {**synthesis, "elapsed_ms": dispatch["elapsed_ms"] + synthesis["elapsed_ms"],
+                          "timed_out": dispatch["timed_out"] or synthesis["timed_out"],
+                          "interrupted": dispatch["interrupted"] or synthesis["interrupted"]}
+            else:
+                agent = parse_events([], None)
+                if remaining <= 0:
+                    result = {**dispatch, "timed_out": True, "termination_reason": "deadline"}
+        else:
+            agent = parse_events([], None)
+    else:
+        agent = parse_events(events, result["exit_code"])
+    overlap = overlap_summary(children)
+    stress_evidence = stress_edit_evidence(children, project) if case in STRESS_CASES else None
     parent_turns = _turn_number(agent.get("turns"))
     child_turn_values = [_turn_number(child.get("turns")) for child in children]
     child_turns = (0 if arm == "stock" else
@@ -1299,8 +1807,12 @@ def run_cell(
         failures.append("parent extension loadout is unverified")
     if result["timed_out"]:
         failures.append("deadline exceeded")
+    if scripted and not dispatch_ok:
+        failures.append("scripted dispatch did not settle after an accepted fixed launch")
     if not agent["success"]:
-        failures.append("Pi did not settle with a successful assistant stop reason")
+        failures.append("Pi synthesis did not settle" if synthesis_attempted else
+                        "scripted synthesis skipped because child evidence is incomplete" if scripted else
+                        "Pi did not settle with a successful assistant stop reason")
     if not grader.get("passed"):
         failures.append("external verifier failed")
     if not usage["known"]:
@@ -1310,6 +1822,8 @@ def run_cell(
             failures.append("child extension loadout is unverified")
         if len(children) != expected_child_count:
             failures.append(f"expected {expected_child_count} child records, found {len(children)}")
+        if any(child.get("status") != "completed" for child in children):
+            failures.append("one or more child runs did not complete")
         if overlap_required and not overlap["evidenced"]:
             failures.append("timestamped overlapping child intervals are unverified")
         if not child_runtime_matches_parent:
@@ -1318,8 +1832,11 @@ def run_cell(
             failures.append("child token usage is unknown")
     if malformed:
         failures.append(f"{malformed} malformed JSONL event(s)")
+    if stress_evidence is not None and not stress_evidence["verified"]:
+        failures.append("same-file edit attempts are unverified")
     record = {
-        "case": case, "arm": arm, "repetition": repetition,
+        "case": case, "arm": arm, "repetition": repetition, "orchestration": orchestration,
+        "case_version": CASE_VERSION, "case_class": "stress" if case in STRESS_CASES else "main",
         "status": "passed" if not failures else "failed",
         "correct": bool(grader.get("passed")), "failures": failures,
         "termination_reason": result["termination_reason"],
@@ -1327,18 +1844,25 @@ def run_cell(
         "settled": agent["settled"], "agent_end": agent["agent_end"],
         "final_stop_reason": agent["final_stop_reason"], "answer": agent["answer"],
         "grader": grader, "seed_sha256": _seed_hash(),
-        "parent_extensions": [] if arm == "stock" else [packages[arm]["entry"]],
+        "event_diagnostics": event_diagnostics,
+        "parent_extensions": ([] if arm == "stock" else [packages[arm]["entry"]]
+                              + ([str(ROOT / "scripted-provider.ts")] if scripted else [])),
         "parent_loadout_verified": parent_loadout_verified,
         "child_loadout": launches, "child_runtime_matches_parent": child_runtime_matches_parent,
         "packages": {key: value for key, value in packages.items() if key == arm},
         "children": children, "overlap": overlap, "overlap_required": overlap_required,
-        "usage": usage, "turns": turns,
+        "stress_evidence": stress_evidence, "usage": usage, "turns": turns,
         "environment": environment_info,
         "artifacts": {
             "cell": str(cell_dir), "project": str(project),
             "events": str(cell_dir / "events.jsonl"), "stderr": str(cell_dir / "stderr.log"),
             "session": str(session_dir), "agent_dir": env["PI_CODING_AGENT_DIR"],
             "grader": grader,
+            **({"debug_precheck": str(debug_precheck)} if debug_precheck else {}),
+            **({"scripted_spec": str(spec_path), "scripted_runtime": scripted_runtime,
+                "synthesis_events": str(cell_dir / "synthesis-events.jsonl") if synthesis_attempted else None,
+                "synthesis_stderr": str(cell_dir / "synthesis-stderr.log") if synthesis_attempted else None}
+               if scripted else {}),
         },
     }
     _write_json(cell_dir / "cell.json", record)
@@ -1353,7 +1877,10 @@ def _new_run_dir(cache_root: Path) -> Path:
 def _cell_passed(cell: dict[str, Any]) -> bool:
     elapsed = cell.get("elapsed_ms")
     return (cell.get("status") == "passed" and cell.get("correct") is True
-            and isinstance(elapsed, (int, float)) and elapsed >= 0)
+            and isinstance(elapsed, (int, float)) and elapsed >= 0
+            and (cell.get("case") not in STRESS_CASES
+                 or isinstance(cell.get("stress_evidence"), dict)
+                 and cell["stress_evidence"].get("verified") is True))
 
 
 def _usage_field(cell: dict[str, Any], field: str) -> int | float | None:
@@ -1422,13 +1949,27 @@ def build_report(
     cases: tuple[str, ...] | list[str] = CASES,
     arms: tuple[str, ...] | list[str] = ARMS,
     repetition_ids: tuple[int, ...] | list[int] | None = None,
+    orchestration: str | None = None, case_version: int | None = None,
 ) -> dict[str, Any]:
     if repetitions < 1:
         raise ValueError("repetitions must be positive")
     repetition_ids = tuple(range(1, repetitions + 1) if repetition_ids is None else repetition_ids)
     if len(repetition_ids) != repetitions:
         raise ValueError("repetition IDs must match planned repetitions")
+    identities = {(cell.get("orchestration", "legacy"), cell.get("case_version", 1))
+                  for cell in cells}
+    if len(identities) > 1:
+        raise ValueError("cannot aggregate different orchestration modes or case versions")
+    inferred = next(iter(identities)) if identities else (orchestration or "legacy", case_version or 1)
+    if ((orchestration is not None and inferred[0] != orchestration)
+            or (case_version is not None and inferred[1] != case_version)):
+        raise ValueError("cell identity does not match its run manifest")
+    orchestration, case_version = inferred
     cases, arms = tuple(cases), tuple(arms)
+    classes = {"stress" if case in STRESS_CASES else "main" for case in cases}
+    if len(classes) > 1:
+        raise ValueError("stress and main cases cannot share a report")
+    case_class = next(iter(classes)) if classes else "main"
     indexed = {(cell.get("case"), cell.get("arm"), cell.get("repetition")): cell for cell in cells}
     case_reports: dict[str, Any] = {}
     failed_cells, missing_cells = [], []
@@ -1458,45 +1999,48 @@ def build_report(
             for repetition in repetition_ids:
                 if (case, arm, repetition) not in indexed:
                     missing_cells.append({"case": case, "arm": arm, "repetition": repetition})
-        baseline = {
-            cell.get("repetition"): cell for cell in cells
-            if cell.get("case") == case and cell.get("arm") == "stock" and _cell_passed(cell)
-        }
         paired: dict[str, Any] = {}
-        for arm in arms:
-            if arm == "stock":
-                continue
-            ratios, base_times, arm_times = [], [], []
-            for cell in cells:
-                repetition = cell.get("repetition")
-                base = baseline.get(repetition)
-                elapsed = cell.get("elapsed_ms")
-                if (cell.get("case") == case and cell.get("arm") == arm and base
-                        and _cell_passed(cell) and isinstance(elapsed, (int, float)) and elapsed > 0):
-                    base_times.append(base["elapsed_ms"])
-                    arm_times.append(elapsed)
-                    ratios.append(base["elapsed_ms"] / elapsed)
-            paired[arm] = {
-                "pairs": len(ratios),
-                "median_speedup": statistics.median(ratios) if ratios else None,
-                "median_stock_elapsed_ms": statistics.median(base_times) if base_times else None,
-                "median_arm_elapsed_ms": statistics.median(arm_times) if arm_times else None,
+        if case not in STRESS_CASES:
+            baseline = {
+                cell.get("repetition"): cell for cell in cells
+                if cell.get("case") == case and cell.get("arm") == "stock" and _cell_passed(cell)
             }
+            for arm in arms:
+                if arm == "stock":
+                    continue
+                ratios, base_times, arm_times = [], [], []
+                for cell in cells:
+                    repetition = cell.get("repetition")
+                    base = baseline.get(repetition)
+                    elapsed = cell.get("elapsed_ms")
+                    if (cell.get("case") == case and cell.get("arm") == arm and base
+                            and _cell_passed(cell) and isinstance(elapsed, (int, float)) and elapsed > 0):
+                        base_times.append(base["elapsed_ms"])
+                        arm_times.append(elapsed)
+                        ratios.append(base["elapsed_ms"] / elapsed)
+                paired[arm] = {
+                    "pairs": len(ratios),
+                    "median_speedup": statistics.median(ratios) if ratios else None,
+                    "median_stock_elapsed_ms": statistics.median(base_times) if base_times else None,
+                    "median_arm_elapsed_ms": statistics.median(arm_times) if arm_times else None,
+                }
         case_reports[case] = {
             "repetitions": repetitions, "arms": arm_reports,
             "paired_speedup": paired,
         }
     summaries = [{
         "case": cell.get("case"), "arm": cell.get("arm"),
-        "repetition": cell.get("repetition"), "status": cell.get("status"),
+        "orchestration": orchestration, "case_version": case_version,
+        "case_class": case_class, "repetition": cell.get("repetition"), "status": cell.get("status"),
         "correct": cell.get("correct"), "elapsed_ms": cell.get("elapsed_ms"),
         "usage": cell.get("usage"), "turns": cell.get("turns"),
         "overlap": cell.get("overlap"), "overlap_required": cell.get("overlap_required"),
-        "failures": cell.get("failures", []),
+        "stress_evidence": cell.get("stress_evidence"), "failures": cell.get("failures", []),
         "cell": cell.get("artifacts", {}).get("cell"),
     } for cell in cells]
     return {
-        "schema_version": 1, "cases": case_reports,
+        "schema_version": 2, "orchestration": orchestration,
+        "case_version": case_version, "case_class": case_class, "cases": case_reports,
         "planned_cells": repetitions * len(cases) * len(arms),
         "recorded_cells": len(cells), "passed_cells": sum(_cell_passed(cell) for cell in cells),
         "failed_cells": failed_cells, "missing_cells": missing_cells, "cells": summaries,
@@ -1580,6 +2124,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"- Run: `{text(report.get('run_id') or 'unknown')}`",
         f"- Mode/state: {text(report.get('mode') or 'unknown')} / {text(report.get('state') or 'unknown')}",
+        f"- Orchestration: {text(report.get('orchestration') or 'legacy')}; case version: {text(report.get('case_version', 1))}",
+        f"- Case class: {text(report.get('case_class') or 'main')}",
         f"- Model: `{text(model_name)}` ({text(report.get('thinking') or 'unknown')})",
         f"- Deadline: {text(deadline)} s" if deadline is not None else "- Deadline: unknown",
         f"- Cells: {report.get('recorded_cells', 0)}/{planned} recorded; "
@@ -1588,6 +2134,12 @@ def render_markdown(report: dict[str, Any]) -> str:
         "Median time uses passing cells only. Speedup is stock time divided by arm time, "
         "using only passing paired repetitions; values above 1× are faster.",
     ]
+    coverage = report.get("capability_coverage")
+    if isinstance(coverage, dict):
+        blocked = coverage.get("blocked", {})
+        detail = ", ".join(f"{text(arm)}: {text(reason)}" for arm, reason in blocked.items())
+        lines.extend(["", f"Scripted capability: {len(coverage.get('verified', []))} verified"
+                      + (f"; blocked: {detail}" if detail else "")])
 
     for case, case_report in report.get("cases", {}).items():
         lines.extend(["", f"## {text(case)}", "",
@@ -1597,7 +2149,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         paired = case_report.get("paired_speedup", {})
         for arm, metrics in case_report.get("arms", {}).items():
             pairs = paired.get(arm, {})
-            speedup = ("baseline" if arm == "stock" else
+            speedup = ("not compared" if case in STRESS_CASES else
+                       "baseline" if arm == "stock" else
                        f"{pairs['median_speedup']:.2f}× (n={pairs['pairs']})"
                        if pairs.get("median_speedup") is not None else "n/a (0 pairs)")
             rate = metrics.get("success_rate")
@@ -1617,9 +2170,12 @@ def render_markdown(report: dict[str, Any]) -> str:
 
         cells = [cell for cell in report.get("cells", []) if cell.get("case") == case]
         if cells:
+            stress = case in STRESS_CASES
             lines.extend(["", "### Attempted cells", "",
-                          "| Repetition | Arm | Status | Correct | Time | Tokens | Cache read tokens | Cache write tokens | Turns | Child overlap | Failure |",
-                          "|---:|---|---|---|---:|---:|---:|---:|---:|---|---|"])
+                          "| Repetition | Arm | Status | Correct | Time | Tokens | Cache read tokens | Cache write tokens | Turns | Child overlap | "
+                          + ("Edit evidence | " if stress else "") + "Failure |",
+                          "|---:|---|---|---|---:|---:|---:|---:|---:|---|"
+                          + ("---|" if stress else "") + "---|"])
             for cell in cells:
                 usage = cell.get("usage")
                 total = (f"{int(usage['total_tokens']):,}"
@@ -1634,11 +2190,15 @@ def render_markdown(report: dict[str, Any]) -> str:
                 correct = ("yes" if cell.get("correct") is True else
                            "no" if cell.get("correct") is False else "Unknown")
                 failures = "; ".join(str(item) for item in cell.get("failures", [])) or "—"
+                evidence = cell.get("stress_evidence")
+                edit_text = (f"verified; {len(evidence.get('attempts', []))} attempts"
+                             if isinstance(evidence, dict) and evidence.get("verified") else "Unknown")
                 lines.append(
                     f"| {text(cell.get('repetition', 'unknown'))} | {text(cell.get('arm', 'unknown'))} | "
                     f"{text(cell.get('status') or 'unknown')} | {correct} | "
                     f"{elapsed(cell.get('elapsed_ms'))} | {total} | {cache_read} | {cache_write} | {turn_total} | "
-                    f"{cell_overlap(case, cell.get('arm', ''), cell.get('overlap'))} | {text(failures)} |"
+                    f"{cell_overlap(case, cell.get('arm', ''), cell.get('overlap'))} | "
+                    + (f"{text(edit_text)} | " if stress else "") + f"{text(failures)} |"
                 )
         else:
             lines.extend(["", "No cells recorded for this case."])
@@ -1662,10 +2222,15 @@ def _load_cells(run_dir: Path) -> list[dict[str, Any]]:
 def _create_run(
     cache_root: Path, mode: str, cases: list[str], arms: list[str], repetitions: int,
     deadline_seconds: int, check: dict[str, Any], repetition_ids: list[int] | None = None,
+    orchestration: str = "scripted",
 ) -> tuple[Path, dict[str, Any]]:
+    if any(case in STRESS_CASES for case in cases) and any(case not in STRESS_CASES for case in cases):
+        raise ValueError("stress and main cases require separate runs")
     run_dir = _new_run_dir(cache_root)
     manifest = {
-        "schema_version": 1, "run_id": run_dir.name, "mode": mode,
+        "schema_version": 2, "run_id": run_dir.name, "mode": mode,
+        "orchestration": orchestration, "case_version": CASE_VERSION,
+        "case_class": "stress" if cases and cases[0] in STRESS_CASES else "main",
         "state": "running", "cases": cases, "arms": arms,
         "repetitions": repetitions,
         "repetition_ids": repetition_ids if repetition_ids is not None else list(range(1, repetitions + 1)),
@@ -1680,28 +2245,55 @@ def _create_run(
     return run_dir, manifest
 
 
+def _blocked_state(check: dict[str, Any], orchestration: str) -> str:
+    if (orchestration == "scripted" and check.get("global_passed", True)
+            and not check.get("package_errors")
+            and any(not item.get("verified") for item in
+                    check.get("scripted_capabilities", {}).values())):
+        return "blocked_capability"
+    return "blocked_preflight"
+
+
+def _report_metadata(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    preflight_check = manifest.get("preflight", {})
+    capabilities = preflight_check.get("scripted_capabilities", {})
+    return {
+        "run_id": manifest.get("run_id"), "run_dir": str(run_dir.resolve()),
+        "mode": manifest.get("mode"), "state": manifest.get("state"),
+        "preflight_passed": preflight_check.get("passed", False),
+        "capability_coverage": {
+            "verified": [arm for arm, item in capabilities.items() if item.get("verified")],
+            "blocked": {**manifest.get("excluded_capabilities", {}),
+                        **{arm: item.get("reason", "unverified") for arm, item in capabilities.items()
+                           if not item.get("verified")}},
+        } if manifest.get("orchestration") == "scripted" else None,
+        "provider": manifest.get("provider"), "model": manifest.get("model"),
+        "thinking": manifest.get("thinking"),
+        "deadline_seconds": manifest.get("deadline_seconds"),
+    }
+
+
 def _save_report(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     report = build_report(
         _load_cells(run_dir), manifest["repetitions"],
         manifest["cases"], manifest["arms"], manifest.get("repetition_ids"),
+        manifest["orchestration"], manifest["case_version"],
     )
-    report.update({
-        "run_id": manifest["run_id"], "run_dir": str(run_dir.resolve()),
-        "mode": manifest["mode"], "state": manifest["state"],
-        "preflight_passed": manifest["preflight"].get("passed", False),
-        "provider": manifest.get("provider"), "model": manifest.get("model"),
-        "thinking": manifest.get("thinking"),
-        "deadline_seconds": manifest.get("deadline_seconds"),
-    })
+    report.update(_report_metadata(run_dir, manifest))
     _write_report_files(run_dir, report)
     _write_json(run_dir / "run.json", manifest)
     return report
 
 
-def _failed_cell(run_dir: Path, case: str, arm: str, repetition: int, error: Exception) -> dict[str, Any]:
+def _failed_cell(
+    run_dir: Path, case: str, arm: str, repetition: int, error: Exception,
+    orchestration: str = "scripted",
+) -> dict[str, Any]:
     cell_dir = private_dir(run_dir / "cells" / f"{case}-{arm}-r{repetition:02d}")
     record = {
         "case": case, "arm": arm, "repetition": repetition,
+        "orchestration": orchestration, "case_version": CASE_VERSION,
+        "case_class": "stress" if case in STRESS_CASES else "main",
         "status": "failed", "correct": False,
         "failures": [f"runner error: {error}"],
         "termination_reason": "runner_error", "artifacts": {"cell": str(cell_dir)},
@@ -1712,39 +2304,43 @@ def _failed_cell(run_dir: Path, case: str, arm: str, repetition: int, error: Exc
 
 def _attempt_cell(
     run_dir: Path, case: str, arm: str, repetition: int, deadline_seconds: int,
-    packages: dict[str, dict[str, Any]],
+    packages: dict[str, dict[str, Any]], orchestration: str = "scripted",
 ) -> dict[str, Any]:
     try:
-        return run_cell(run_dir, case, arm, repetition, deadline_seconds, packages)
+        return run_cell(run_dir, case, arm, repetition, deadline_seconds, packages,
+                        orchestration=orchestration, cache_root=run_dir.parent.parent)
     except Exception as error:
-        return _failed_cell(run_dir, case, arm, repetition, error)
+        return _failed_cell(run_dir, case, arm, repetition, error, orchestration)
 
 
 def _record_attempt(manifest: dict[str, Any], record: dict[str, Any], run_dir: Path) -> None:
     manifest["completed_cells"].append({
         "case": record["case"], "arm": record["arm"],
         "repetition": record["repetition"], "status": record["status"],
+        "orchestration": record.get("orchestration", "legacy"),
     })
     _write_json(run_dir / "run.json", manifest)
 
 
-def _rotated_arms(offset: int) -> list[str]:
-    index = offset % len(ARMS)
-    return list(ARMS[index:] + ARMS[:index])
+def _rotated_arms(offset: int, arms: tuple[str, ...] = ARMS) -> list[str]:
+    index = offset % len(arms)
+    return list(arms[index:] + arms[:index])
 
 
-def matrix_schedule(cases: list[str], repetitions: int) -> list[tuple[str, str, int]]:
+def matrix_schedule(
+    cases: list[str], repetitions: int, arms: tuple[str, ...] = ARMS,
+) -> list[tuple[str, str, int]]:
     if repetitions < 3:
         raise ValueError("matrix requires at least 3 repetitions")
-    if not cases:
-        raise ValueError("at least one case is required")
-    schedule = [(cases[0], arm, 1) for arm in _rotated_arms(0)]
+    if not cases or not arms:
+        raise ValueError("at least one case and arm are required")
+    schedule = [(cases[0], arm, 1) for arm in _rotated_arms(0, arms)]
     for repetition in range(1, repetitions + 1):
         for case_index, case in enumerate(cases):
             if repetition == 1 and case_index == 0:
                 continue
             schedule.extend((case, arm, repetition)
-                            for arm in _rotated_arms(repetition - 1 + case_index))
+                            for arm in _rotated_arms(repetition - 1 + case_index, arms))
     return schedule
 
 
@@ -1754,7 +2350,8 @@ def _run_cells(
 ) -> list[dict[str, Any]]:
     records = []
     for case, arm, repetition in cells:
-        record = _attempt_cell(run_dir, case, arm, repetition, deadline_seconds, check["package_info"])
+        record = _attempt_cell(run_dir, case, arm, repetition, deadline_seconds,
+                               check["package_info"], manifest["orchestration"])
         records.append(record)
         interrupted = record.get("termination_reason") == "interrupted"
         if interrupted:
@@ -1770,14 +2367,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-root", type=Path, default=default_cache_root())
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("install", help="install and verify the exact pinned extension packages")
-    commands.add_parser("preflight", help="check wrapper, package pins, and isolation prerequisites")
+    preflight_command = commands.add_parser("preflight", help="check wrapper, package pins, and native scripted capability")
+    preflight_command.add_argument("--arm", choices=tuple(PINS), action="append")
     run = commands.add_parser("run", help="run one fresh benchmark cell")
-    run.add_argument("--case", choices=CASES, required=True)
+    run.add_argument("--case", choices=(*CASES, *STRESS_CASES), required=True)
     run.add_argument("--arm", choices=ARMS, required=True)
     run.add_argument("--repetition", type=int, default=1)
     run.add_argument("--deadline", type=int, default=DEFAULT_DEADLINE)
+    run.add_argument("--orchestration", choices=("scripted", "model-directed"), default="scripted")
     smoke = commands.add_parser("smoke", help="run one triage cell per arm")
     smoke.add_argument("--deadline", type=int, default=DEFAULT_DEADLINE)
+    smoke.add_argument("--orchestration", choices=("scripted", "model-directed"), default="scripted")
     matrix = commands.add_parser(
         "matrix", help="run paired repetitions for each case",
         description=f"Run paired repetitions across arms: {', '.join(ARMS)}.",
@@ -1785,6 +2385,8 @@ def _parser() -> argparse.ArgumentParser:
     matrix.add_argument("--repetitions", type=int, default=3, help="repetitions per case and arm (minimum 3)")
     matrix.add_argument("--deadline", type=int, default=DEFAULT_DEADLINE)
     matrix.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES))
+    matrix.add_argument("--arms", nargs="+", choices=ARMS, default=list(ARMS))
+    matrix.add_argument("--orchestration", choices=("scripted", "model-directed"), default="scripted")
     report = commands.add_parser("report", help="summarize saved cell.json files")
     report.add_argument("run_dir", type=Path)
     report.add_argument("--repetitions", type=int)
@@ -1800,7 +2402,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0
         if args.command == "preflight":
-            result = preflight(cache_root)
+            result = preflight(cache_root, arms=tuple(args.arm) if args.arm else None, scripted=True)
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0 if result["passed"] else 1
         if args.command == "report":
@@ -1817,25 +2419,29 @@ def main(argv: list[str] | None = None) -> int:
                            else manifest.get("repetitions") or max(
                                (cell.get("repetition", 0) for cell in cells), default=1))
             repetition_ids = manifest.get("repetition_ids") if args.repetitions is None else None
-            result = build_report(cells, repetitions, cases, arms, repetition_ids)
-            result.update({"run_dir": str(run_dir), "run_id": manifest.get("run_id"),
-                           "mode": manifest.get("mode"), "state": manifest.get("state"),
-                           "provider": manifest.get("provider"), "model": manifest.get("model"),
-                           "thinking": manifest.get("thinking"),
-                           "deadline_seconds": manifest.get("deadline_seconds")})
-            _write_report_files(run_dir, result)
+            orchestration = manifest.get("orchestration", "legacy")
+            result = build_report(cells, repetitions, cases, arms, repetition_ids,
+                                  orchestration, manifest.get("case_version", 1))
+            result.update(_report_metadata(run_dir, manifest))
+            if orchestration == "legacy":
+                result["markdown_report"] = None
+            else:
+                _write_report_files(run_dir, result)
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0
         if args.command == "run":
             if args.deadline < 1 or args.repetition < 1:
                 raise ValueError("deadline and repetition must be positive")
-            check = preflight(cache_root)
+            if args.case in STRESS_CASES and (args.arm == "stock" or args.orchestration != "scripted"):
+                raise ValueError("same-file stress requires a scripted plugin arm")
+            check = preflight(cache_root, arms=(args.arm,) if args.arm != "stock" else (),
+                              scripted=args.orchestration == "scripted")
             run_dir, manifest = _create_run(
                 cache_root, "single", [args.case], [args.arm], 1, args.deadline, check,
-                [args.repetition],
+                [args.repetition], args.orchestration,
             )
             if not check["passed"]:
-                manifest["state"] = "blocked_preflight"
+                manifest["state"] = _blocked_state(check, args.orchestration)
                 report = _save_report(run_dir, manifest)
                 print(json.dumps(report, indent=2, sort_keys=True))
                 return 1
@@ -1850,12 +2456,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "smoke":
             if args.deadline < 1:
                 raise ValueError("deadline must be positive")
-            check = preflight(cache_root)
+            check = preflight(cache_root, arms=tuple(PINS),
+                              scripted=args.orchestration == "scripted")
             run_dir, manifest = _create_run(
-                cache_root, "smoke", ["triage"], list(ARMS), 1, args.deadline, check
+                cache_root, "smoke", ["triage"], list(ARMS), 1, args.deadline, check,
+                orchestration=args.orchestration,
             )
             if not check["passed"]:
-                manifest["state"] = "blocked_preflight"
+                manifest["state"] = _blocked_state(check, args.orchestration)
             else:
                 cells = _run_cells(run_dir, manifest, check,
                                    [("triage", arm, 1) for arm in _rotated_arms(0)], args.deadline)
@@ -1868,30 +2476,34 @@ def main(argv: list[str] | None = None) -> int:
             if args.deadline < 1 or args.repetitions < 3:
                 raise ValueError("matrix requires a positive deadline and at least 3 repetitions")
             cases = list(dict.fromkeys(args.cases))
-            if not cases:
-                raise ValueError("at least one case is required")
-            check = preflight(cache_root)
+            arms = tuple(dict.fromkeys(args.arms))
+            if not cases or not arms:
+                raise ValueError("at least one case and arm are required")
+            check = preflight(cache_root, arms=tuple(arm for arm in arms if arm != "stock"),
+                              scripted=args.orchestration == "scripted")
             run_dir, manifest = _create_run(
-                cache_root, "matrix", cases, list(ARMS), args.repetitions, args.deadline, check
+                cache_root, "matrix", cases, list(arms), args.repetitions, args.deadline, check,
+                orchestration=args.orchestration,
             )
+            if args.orchestration == "scripted" and "fabric" not in arms:
+                manifest["excluded_capabilities"] = {
+                    "fabric": f"not selected: {FABRIC_OFFLINE_BLOCK_REASON}",
+                }
             if not check["passed"]:
-                manifest["state"] = "blocked_preflight"
+                manifest["state"] = _blocked_state(check, args.orchestration)
                 report = _save_report(run_dir, manifest)
                 print(json.dumps(report, indent=2, sort_keys=True))
                 return 1
-            schedule = matrix_schedule(cases, args.repetitions)
-            smoke = _run_cells(run_dir, manifest, check, schedule[:len(ARMS)], args.deadline)
-            if manifest["state"] == "interrupted" or not all(_cell_passed(cell) for cell in smoke):
-                if manifest["state"] != "interrupted":
-                    manifest["state"] = "smoke_failed"
-                report = _save_report(run_dir, manifest)
-                print(json.dumps(report, indent=2, sort_keys=True))
-                return 130 if manifest["state"] == "interrupted" else 1
-            for cell in schedule[len(ARMS):]:
-                _run_cells(run_dir, manifest, check, [cell], args.deadline)
+            schedule = matrix_schedule(cases, args.repetitions, arms)
+            gate_size = len(cases) * len(arms) if args.orchestration == "scripted" else 0
+            for index, cell in enumerate(schedule):
+                record = _run_cells(run_dir, manifest, check, [cell], args.deadline)[0]
                 if manifest["state"] == "interrupted":
                     break
-            if manifest["state"] != "interrupted":
+                if index < gate_size and not _cell_passed(record):
+                    manifest["state"] = "gate_failed"
+                    break
+            if manifest["state"] == "running":
                 manifest["state"] = "complete"
             report = _save_report(run_dir, manifest)
             print(json.dumps(report, indent=2, sort_keys=True))

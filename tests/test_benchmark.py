@@ -74,7 +74,7 @@ class LauncherChecks(unittest.TestCase):
                 expected_tools = {
                     'stock': 'read,grep,find,ls,bash,edit,write',
                     'subagents': 'read,grep,find,ls,bash,edit,write,subagents_enable,subagent',
-                    'tintin-subagents': 'read,grep,find,ls,bash,edit,write,Agent',
+                    'tintin-subagents': 'read,grep,find,ls,bash,edit,write,Agent,get_subagent_result',
                     'fabric': 'read,grep,find,ls,bash,edit,write,fabric_exec',
                 }
                 self.assertEqual(command[command.index('--tools') + 1], expected_tools[arm])
@@ -85,6 +85,41 @@ class LauncherChecks(unittest.TestCase):
                 else:
                     self.assertEqual(extensions, [str(self.ENTRIES[arm])])
                     self.assertTrue(Path(extensions[0]).is_absolute())
+
+    def test_scripted_dispatch_loads_only_the_package_and_driver_tools(self):
+        expected_tools = {
+            'subagents': 'subagents_enable,subagent',
+            'tintin-subagents': 'Agent,get_subagent_result',
+            'fabric': 'fabric_exec',
+        }
+        for arm, tools in expected_tools.items():
+            with self.subTest(arm=arm):
+                command = benchmark.build_scripted_command(
+                    arm, '/cell/session', self.ENTRIES, pi_binary='/usr/local/bin/pi',
+                )
+                self.assertEqual(command[command.index('--mode') + 1], 'rpc')
+                self.assertEqual(command[command.index('--provider') + 1], 'benchmark-driver')
+                self.assertEqual(command[command.index('--model') + 1], 'scripted')
+                self.assertEqual(command[command.index('--tools') + 1], tools)
+                self.assertEqual([command[i + 1] for i, value in enumerate(command[:-1])
+                                  if value == '-e'],
+                                 [str(self.ENTRIES[arm]), str(ROOT / 'scripted-provider.ts')])
+                self.assertIn('--no-context-files', command)
+                self.assertIn('--no-approve', command)
+                self.assertNotIn('--print', command)
+                self.assertNotIn('bash', tools)
+
+    def test_scripted_synthesis_uses_the_parent_model_without_tools(self):
+        command = benchmark.build_synthesis_command('Combine child results', '/cell/synthesis',
+                                                    pi_binary='/usr/local/bin/pi')
+        self.assertEqual(command[command.index('--provider') + 1], 'openai')
+        self.assertEqual(command[command.index('--model') + 1], 'gpt-6-sol')
+        self.assertEqual(command[command.index('--thinking') + 1], 'xhigh')
+        self.assertIn('--no-tools', command)
+        self.assertIn('--no-extensions', command)
+        self.assertNotIn('--tools', command)
+        self.assertNotIn('-e', command)
+        self.assertEqual(command[-2:], ['--print', 'Combine child results'])
 
     def test_cell_environment_is_private_and_routes_child_pi_to_wrapper(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -110,6 +145,13 @@ class LauncherChecks(unittest.TestCase):
             self.assertEqual(
                 settings['subagents']['agentOverrides']['worker']['thinking'], 'xhigh',
             )
+            scripted = build_environment(
+                Path(tmp) / 'scripted-cell', base, '/usr/local/bin/pi', runtime_root,
+                subagents_worker_model='openai/gpt-6-sol',
+            )
+            worker = json.loads((Path(scripted['PI_CODING_AGENT_DIR']) / 'settings.json').read_text())[
+                'subagents']['agentOverrides']['worker']
+            self.assertEqual(worker, {'thinking': 'xhigh', 'model': 'openai/gpt-6-sol'})
 
     def test_preflight_accepts_wrapper_auth_without_openai_key(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -155,6 +197,101 @@ class LauncherChecks(unittest.TestCase):
             self.assertTrue(result['passed'], result['errors'])
             self.assertNotIn('credential_present', result)
 
+    def test_preflight_scopes_packages_and_scripted_capability_to_selected_arm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            (cache / 'package-manifest.json').write_text(json.dumps({'packages': {
+                'fabric': {'sha256': 'hash', 'integrity': PINS['fabric']['integrity']},
+            }}))
+            version = SimpleNamespace(returncode=0, stdout='0.87.1\n')
+            help_result = SimpleNamespace(returncode=0, stdout=(
+                '--mode --provider --model --thinking --session-dir --tools --no-extensions '
+                '--no-skills --no-prompt-templates --no-themes --no-context-files --no-approve'
+            ))
+            with patch('benchmark.validate_pi_binary'), \
+                 patch('benchmark.subprocess.run', side_effect=[version, help_result,
+                                                                 version, help_result]), \
+                 patch('benchmark.npm_integrity', return_value=PINS['fabric']['integrity']) as registry, \
+                 patch('benchmark.inspect_package', return_value={
+                     'sha256': 'hash', 'integrity_verified': True,
+                 }), \
+                 patch('benchmark.scripted_ai_runtime', return_value={
+                     'entry': '/cache/pi-ai/dist/index.js', 'version': '0.87.0',
+                 }) as runtime:
+                selected = benchmark.preflight(cache, arms=('fabric',), scripted=True)
+                stock = benchmark.preflight(cache / 'empty', arms=(), scripted=True)
+            self.assertFalse(selected['passed'])
+            self.assertEqual(list(selected['package_info']), ['fabric'])
+            self.assertFalse(selected['scripted_capabilities']['fabric']['verified'])
+            self.assertIn('child did not exit', selected['scripted_capabilities']['fabric']['reason'])
+            runtime.assert_called_once_with(cache, 'fabric')
+            registry.assert_called_once_with(f"{PINS['fabric']['name']}@{PINS['fabric']['version']}")
+            self.assertTrue(stock['passed'], stock['errors'])
+            self.assertEqual(stock['package_info'], {})
+
+    def test_scripted_preflight_requires_native_offline_proof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            arm = 'tintin-subagents'
+            pin = benchmark.SUBAGENT_RUNTIME_PIN
+            (cache / 'package-manifest.json').write_text(json.dumps({'packages': {arm: {
+                'sha256': 'package-hash', 'integrity': PINS[arm]['integrity'],
+                'host_runtime': {'sha256': 'host-hash', 'version': pin['version'],
+                                 'integrity': pin['integrity']},
+            }}}))
+            integrities = {f"{PINS[arm]['name']}@{PINS[arm]['version']}": PINS[arm]['integrity'],
+                           f"{pin['name']}@{pin['version']}": pin['integrity']}
+            help_flags = ('--mode --provider --model --thinking --session-dir --tools '
+                          '--no-extensions --no-skills --no-prompt-templates --no-themes '
+                          '--no-context-files --no-approve')
+            def cli(command, **_kwargs):
+                return SimpleNamespace(returncode=0,
+                                       stdout='0.87.1\n' if '--version' in command else help_flags)
+
+            with patch('benchmark.validate_pi_binary'), \
+                 patch('benchmark.subprocess.run', side_effect=cli), \
+                 patch('benchmark.npm_integrity', side_effect=integrities.__getitem__), \
+                 patch('benchmark.inspect_package', return_value={
+                     'entry': '/cache/tintin/index.ts', 'sha256': 'package-hash',
+                     'integrity_verified': True,
+                 }), \
+                 patch('benchmark.inspect_host_runtime', return_value={
+                     'root': '/cache/host', 'sha256': 'host-hash', 'version': pin['version'],
+                     'integrity': pin['integrity'], 'integrity_verified': True,
+                 }), \
+                 patch('benchmark.scripted_ai_runtime', return_value={
+                     'entry': '/cache/pi-ai/dist/index.js', 'version': '0.99.1',
+                 }), \
+                 patch('benchmark._prove_scripted_capability',
+                       return_value={'child_id': 'native-1', 'synthetic_tokens': 2}) as proof:
+                admitted = benchmark.preflight(cache, arms=(arm,), scripted=True, source_env={})
+                proof.side_effect = RuntimeError('missing native join')
+                blocked = benchmark.preflight(cache, arms=(arm,), scripted=True, source_env={})
+
+        self.assertTrue(admitted['passed'], admitted['errors'])
+        self.assertEqual(admitted['scripted_capabilities'][arm]['proof']['child_id'], 'native-1')
+        self.assertEqual(proof.call_count, 2)
+        self.assertEqual(proof.call_args_list[0].args[0], arm)
+        self.assertFalse(blocked['passed'])
+        self.assertFalse(blocked['scripted_capabilities'][arm]['verified'])
+        self.assertIn('missing native join', blocked['scripted_capabilities'][arm]['reason'])
+        self.assertEqual(blocked['package_errors'], {})
+
+    def test_preflight_cli_requires_selected_arms_offline_proof(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch('benchmark.preflight', side_effect=[
+                 {'passed': False, 'errors': ['native child identity missing']},
+                 {'passed': True, 'errors': []},
+             ]) as check, contextlib.redirect_stdout(io.StringIO()):
+            args = ['--cache-root', tmp, 'preflight', '--arm', 'subagents',
+                    '--arm', 'tintin-subagents']
+            self.assertEqual(main(args), 1)
+            self.assertEqual(main(args), 0)
+        self.assertEqual(check.call_count, 2)
+        self.assertTrue(all(item.kwargs == {
+            'arms': ('subagents', 'tintin-subagents'), 'scripted': True,
+        } for item in check.call_args_list))
+
     def test_pinned_host_runtime_is_installed_per_subagents_package_prefix(self):
         for arm in HOST_RUNTIME_ARMS:
             with self.subTest(arm=arm), tempfile.TemporaryDirectory() as tmp:
@@ -179,6 +316,33 @@ class LauncherChecks(unittest.TestCase):
                         cache / 'cell', {}, '/usr/local/bin/pi', info['root'],
                     )
                     self.assertEqual(env['PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT'], info['root'])
+
+    def test_scripted_ai_runtime_uses_the_arms_locked_dependency(self):
+        paths = {
+            'fabric': 'node_modules/@earendil-works/pi-ai',
+            'subagents': 'node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai',
+        }
+        for arm, relative in paths.items():
+            with self.subTest(arm=arm), tempfile.TemporaryDirectory() as tmp:
+                cache = Path(tmp)
+                prefix = cache / 'packages' / arm
+                package = prefix / relative
+                (package / 'dist').mkdir(parents=True)
+                (package / 'dist' / 'index.js').write_text('// pinned runtime')
+                (package / 'package.json').write_text(json.dumps({
+                    'name': '@earendil-works/pi-ai', 'version': '0.87.1',
+                }))
+                (prefix / 'package-lock.json').write_text(json.dumps({
+                    'packages': {relative: {'version': '0.87.1', 'integrity': 'pin'}},
+                }))
+                info = benchmark.scripted_ai_runtime(cache, arm)
+                self.assertEqual(info['entry'], str((package / 'dist' / 'index.js').resolve()))
+                self.assertEqual(info['version'], '0.87.1')
+                (package / 'package.json').write_text(json.dumps({
+                    'name': '@earendil-works/pi-ai', 'version': 'unlocked',
+                }))
+                with self.assertRaises(ValueError):
+                    benchmark.scripted_ai_runtime(cache, arm)
 
     def test_pi_real_requires_both_lowercase_proxy_variables(self):
         with self.assertRaises(ValueError):
@@ -219,14 +383,16 @@ class LauncherChecks(unittest.TestCase):
         self.assertIn('child cap is 3', fabric)
         tintin = build_prompt('triage', 'tintin-subagents', Path('/cell/project'))
         self.assertIn('Agent tool from @tintinweb/pi-subagents', tintin)
-        self.assertIn('run_in_background', tintin)
+        self.assertIn('get_subagent_result', tintin)
+        self.assertIn('run_in_background true', tintin)
+        self.assertIn('wait:true', tintin)
         self.assertIn('isolated', tintin)
         self.assertIn('Agent arguments =', tintin)
-        self.assertIn('one assistant message, without waiting between siblings', tintin)
         tintin_specs = json.loads(tintin.partition('Agent arguments = ')[2])
         self.assertTrue(all(spec['model'] == f'{benchmark.PROVIDER}/{benchmark.MODEL}'
                             and spec['thinking'] == benchmark.THINKING
-                            and spec['max_turns'] == 10 for spec in tintin_specs))
+                            and spec['max_turns'] == 10
+                            and spec['run_in_background'] is True for spec in tintin_specs))
 
     def test_success_requires_settled_agent_and_nonerror_final_stop(self):
         good = [
@@ -240,6 +406,17 @@ class LauncherChecks(unittest.TestCase):
         result = parse_events(good, exit_code=0)
         self.assertTrue(result['success'])
         self.assertTrue(result['settled'])
+        notification_events = [
+            good[0],
+            {'type': 'custom_message', 'customType': 'subagent-notification'},
+            {'type': 'message_end', 'message': {
+                'id': 'm2', 'role': 'assistant', 'stopReason': 'stop', 'content': [],
+            }},
+            *good[1:],
+        ]
+        notified = parse_events(notification_events, exit_code=0)
+        self.assertTrue(notified['success'])
+        self.assertEqual(notified['answer'], 'ok')
         bad = [dict(good[0], message=dict(good[0]['message'], stopReason='error')),
                *good[1:]]
         self.assertFalse(parse_events(bad, exit_code=0)['success'])
@@ -271,38 +448,93 @@ class LauncherChecks(unittest.TestCase):
             self.assertEqual(json.loads((root / 'events.jsonl').read_text())['type'],
                              'agent_settled')
 
-    def test_run_process_observes_agent_tool_interval_without_mutating_events(self):
+    def test_rpc_driver_waits_for_settlement_before_closing_stdin(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             fake = root / 'fake-pi'
             fake.write_text('\n'.join([
                 '#!' + sys.executable,
-                'import json, time',
-                "print(json.dumps({'type':'tool_execution_start','toolCallId':'a','toolName':'Agent'}), flush=True)",
-                'time.sleep(0.02)',
-                "print(json.dumps({'type':'tool_execution_end','toolCallId':'a','toolName':'Agent'}), flush=True)",
+                'import json, os, sys',
+                'from pathlib import Path',
+                'request = json.loads(sys.stdin.readline())',
+                'print(json.dumps({"type":"response","id":request["id"],"command":"prompt","success":True}), flush=True)',
+                'print(json.dumps({"type":"tool_execution_start","toolCallId":"c1","toolName":"hello","args":{}}), flush=True)',
+                'print(json.dumps({"type":"tool_execution_end","toolCallId":"c1","toolName":"hello","result":{},"isError":False}), flush=True)',
+                'print(json.dumps({"type":"agent_settled"}), flush=True)',
+                'Path(os.environ["CLOSED_FILE"]).write_text("stdin closed" if sys.stdin.read() == "" else "not closed")',
             ]) + '\n')
             fake.chmod(0o700)
-            result = run_process(
-                [str(fake)], root, {}, root / 'events.jsonl', root / 'stderr.log',
-                deadline_seconds=5, observed_tools=('Agent',),
+            result = benchmark.run_rpc_process(
+                [str(fake)], root, {**os.environ, 'CLOSED_FILE': str(root / 'closed')},
+                root / 'events.jsonl', root / 'stderr.log', 5, 'fixed task',
             )
-            interval = result['tool_call_times']['a']
-            raw_events = (root / 'events.jsonl').read_text()
-        self.assertLess(interval['start'], interval['end'])
-        self.assertNotIn('observedAt', raw_events)
+            events, malformed, _ = benchmark.read_events(root / 'events.jsonl')
+            self.assertEqual(result['exit_code'], 0)
+            self.assertTrue(result['settled'])
+            self.assertFalse(result['timed_out'])
+            self.assertEqual(malformed, 0)
+            self.assertEqual([event['type'] for event in events[-3:]],
+                             ['tool_execution_start', 'tool_execution_end', 'agent_settled'])
+            self.assertEqual((root / 'closed').read_text(), 'stdin closed')
 
-    def test_read_events_ignores_headroom_relay_marker_but_counts_other_corruption(self):
+    @unittest.skipUnless(os.name == 'posix', 'process groups require POSIX')
+    def test_rpc_driver_stops_unsettled_process_at_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stopped = root / 'child.stopped'
+            ready = root / 'child.ready'
+            child_code = '\n'.join([
+                'import signal, time',
+                'from pathlib import Path',
+                'def stop(*_):',
+                f'    Path({str(stopped)!r}).write_text("stopped")',
+                '    raise SystemExit(0)',
+                'signal.signal(signal.SIGTERM, stop)',
+                f'Path({str(ready)!r}).write_text("ready")',
+                'while True: time.sleep(0.05)',
+            ])
+            fake = root / 'fake-pi'
+            fake.write_text('\n'.join([
+                '#!' + sys.executable,
+                'import os, subprocess, sys, time',
+                'sys.stdin.readline()',
+                f'subprocess.Popen([sys.executable, "-c", {child_code!r}])',
+                f'while not os.path.exists({str(ready)!r}): time.sleep(0.01)',
+                'time.sleep(60)',
+            ]) + '\n')
+            fake.chmod(0o700)
+            result = benchmark.run_rpc_process([str(fake)], root, dict(os.environ),
+                                               root / 'events.jsonl', root / 'stderr.log',
+                                               0.5, 'fixed task')
+            self.assertTrue(result['timed_out'])
+            self.assertFalse(result['settled'])
+            self.assertEqual(result['termination_reason'], 'deadline')
+            deadline = time.monotonic() + 2
+            while not stopped.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(stopped.exists(), 'child survived RPC process-group termination')
+
+    def test_read_events_preserves_jsonl_and_counts_known_relay_diagnostics(self):
+        final = {'type': 'message_end', 'message': {
+            'id': 'final', 'role': 'assistant', 'stopReason': 'stop',
+            'content': [{'type': 'text', 'text': 'ok\u2028still ok'}],
+        }}
         with tempfile.TemporaryDirectory() as tmp:
             events_path = Path(tmp) / 'events.jsonl'
             events_path.write_text(
                 '{"type":"agent_start"}\n'
+                + json.dumps(final, ensure_ascii=False) + '\n'
                 '[mcporter] stderr from headroom\n'
+                '[mcporter] stderr from serena\n'
+                '[mcporter] stderr from unknown\n'
                 'not-json\n'
+                '{"type":"agent_settled"}\n'
             )
-            events, malformed = benchmark.read_events(events_path)
-        self.assertEqual(events, [{'type': 'agent_start'}])
-        self.assertEqual(malformed, 1)
+            events, malformed, diagnostics = benchmark.read_events(events_path)
+        self.assertEqual(events, [{'type': 'agent_start'}, final, {'type': 'agent_settled'}])
+        self.assertEqual(malformed, 2)
+        self.assertEqual(diagnostics, {'headroom': 1, 'serena': 1})
+        self.assertEqual(benchmark.parse_events(events, 0)['answer'], 'ok\u2028still ok')
 
     @unittest.skipUnless(os.name == 'posix', 'process groups require POSIX')
     def test_deadline_terminates_the_entire_process_group(self):
@@ -577,6 +809,8 @@ class LauncherChecks(unittest.TestCase):
             records = extract_children(events, 'subagents', session_dir)
             self.assertEqual(len(records), 3)
             self.assertEqual([record['turns'] for record in records], [2, 1, 1])
+            self.assertEqual([record['sessionFile'] for record in records],
+                             [str(path.resolve()) for path in session_paths])
             self.assertTrue(overlap_summary(records)['evidenced'])
             self.assertTrue(all(record['usage']['known'] for record in records))
             failed_events = list(events)
@@ -602,54 +836,146 @@ class LauncherChecks(unittest.TestCase):
             self.assertFalse(child_launch_evidence(
                 'subagents', bad_events, 'triage', project_dir, deadline)['verified'])
 
-    def test_tintin_launch_accepts_only_schema_defaults_and_extracts_effective_settings(self):
+    def test_tintin_background_launches_match_results_and_real_overlap(self):
         project_dir = Path('/cell/project')
         specs = benchmark._tintin_agent_specs(benchmark._child_tasks('triage', project_dir))
-        events = [
-            {'type': 'tool_execution_start', 'toolCallId': f'agent-{index}',
-             'toolName': 'Agent', 'args': {**spec, 'resume': '', 'schedule': ''}}
-            for index, spec in enumerate(specs)
-        ]
-        events.extend(
-            {'type': 'tool_execution_end', 'toolCallId': f'agent-{index}',
-             'toolName': 'Agent', 'result': {
-                 'details': {'agentId': f'child-{index}', 'status': 'completed',
-                             'turnCount': 2, 'durationMs': 100,
-                             'tags': ['twin', 'thinking: xhigh']},
-                 'usage': {'input': 1, 'output': 2, 'cacheRead': 3,
-                           'cacheWrite': 4, 'totalTokens': 10},
-             }, 'isError': False}
-            for index, _ in enumerate(specs)
-        )
-        launch = child_launch_evidence('tintin-subagents', events, 'triage', project_dir, 900)
-        self.assertTrue(launch['verified'], launch)
-        tool_call_times = {
-            f'agent-{index}': {'start': index + 1, 'end': index + 10}
-            for index in range(len(specs))
-        }
-        children = extract_children(events, 'tintin-subagents', tool_call_times=tool_call_times)
-        self.assertEqual(len(children), 3)
-        self.assertTrue(all(child['model'] == f'{benchmark.PROVIDER}/{benchmark.MODEL}'
-                            and child['thinking'] == benchmark.THINKING for child in children))
-        self.assertTrue(all(child['usage']['known'] for child in children))
-        self.assertEqual([child['turns'] for child in children], [2, 2, 2])
-        self.assertEqual(overlap_summary(children)['max_concurrency'], 3)
+        identifiers = [f'child-{index}-agent' for index in range(len(specs))]
+        with tempfile.TemporaryDirectory() as tmp:
+            session_dir = Path(tmp) / 'cell' / 'session'
+            session_root = session_dir.parent / 'agent' / 'sessions' / 'fixture'
+            session_root.mkdir(parents=True)
+            events = []
+            outputs = []
+            intervals = [(1000, 5000), (1200, 5200), (1400, 5400)]
 
-        sequential = [event for index in range(len(specs))
-                      for event in (events[index], events[len(specs) + index])]
-        self.assertFalse(child_launch_evidence(
-            'tintin-subagents', sequential, 'triage', project_dir, 900)['verified'])
+            for index, spec in enumerate(specs):
+                identifier = identifiers[index]
+                output = json.dumps({'child': spec['name']})
+                outputs.append(output)
+                tool_id = f'agent-{index}'
+                events.extend([
+                    {'type': 'tool_execution_start', 'toolCallId': tool_id,
+                     'toolName': 'Agent',
+                     'args': {**spec, 'resume': '', 'schedule': ''}},
+                    {'type': 'tool_execution_end', 'toolCallId': tool_id,
+                     'toolName': 'Agent', 'isError': False,
+                     'result': {'content': [{'type': 'text', 'text': f'Agent ID: {identifier}'}],
+                                'details': {'agentId': identifier, 'status': 'background'} }},
+                    {'type': 'entry_appended', 'entry': {'type': 'custom',
+                     'customType': 'subagents:record', 'data': {
+                         'id': identifier, 'type': 'general-purpose',
+                         'description': spec['description'], 'status': 'completed',
+                         'result': output, 'startedAt': intervals[index][0],
+                         'completedAt': intervals[index][1],
+                     }}},
+                ])
+                session_events = [
+                    {'type': 'session', 'timestamp': '2026-09-30T00:00:00.000Z'},
+                    {'type': 'model_change', 'provider': benchmark.PROVIDER,
+                     'modelId': benchmark.MODEL},
+                    {'type': 'thinking_level_change', 'thinkingLevel': benchmark.THINKING},
+                    {'type': 'session_info',
+                     'name': f'general-purpose#{identifier[:8]}'},
+                ]
+                for turn in range(index + 2):
+                    session_events.append({
+                        'type': 'message', 'timestamp': f'2026-09-30T00:00:{turn + 1:02d}.000Z',
+                        'message': {'id': f'{identifier}-turn-{turn}', 'role': 'assistant',
+                                    'stopReason': 'stop' if turn == index + 1 else 'toolUse',
+                                    'content': [{'type': 'text', 'text': output}]},
+                    })
+                (session_root / f'{index}.jsonl').write_text(
+                    '\n'.join(json.dumps(event) for event in session_events) + '\n'
+                )
 
-        wrong_thinking = list(events)
-        wrong_thinking[0] = {**wrong_thinking[0],
-                             'args': {**wrong_thinking[0]['args'], 'thinking': 'medium'}}
-        self.assertFalse(child_launch_evidence(
-            'tintin-subagents', wrong_thinking, 'triage', project_dir, 900)['verified'])
-        stale_resume = list(events)
-        stale_resume[0] = {**stale_resume[0],
-                           'args': {**stale_resume[0]['args'], 'resume': 'old-agent'}}
-        self.assertFalse(child_launch_evidence(
-            'tintin-subagents', stale_resume, 'triage', project_dir, 900)['verified'])
+            for index, spec in enumerate(specs):
+                identifier = identifiers[index]
+                result_text = (
+                    f'Agent: {identifier}\nType: general-purpose | Status: completed | Tool uses: 1 | Duration: 4s\n'
+                    f'Description: {spec["description"]}\n\n{outputs[index]}'
+                )
+                result_id = f'result-{index}'
+                events.extend([
+                    {'type': 'tool_execution_start', 'toolCallId': result_id,
+                     'toolName': 'get_subagent_result',
+                     'args': {'agent_id': identifier, 'wait': True}},
+                    {'type': 'tool_execution_end', 'toolCallId': result_id,
+                     'toolName': 'get_subagent_result', 'isError': False,
+                     'result': {'content': [{'type': 'text', 'text': result_text}]}},
+                ])
+
+            self.assertTrue(child_launch_evidence(
+                'tintin-subagents', events, 'triage', project_dir, 900)['verified'])
+            children = extract_children(events, 'tintin-subagents', session_dir=session_dir)
+            self.assertEqual([child['turns'] for child in children], [2, 3, 4])
+            self.assertTrue(all(Path(child['sessionFile']).is_file() for child in children))
+            self.assertTrue(all(child['model'] == f'{benchmark.PROVIDER}/{benchmark.MODEL}'
+                                and child['thinking'] == benchmark.THINKING for child in children))
+            self.assertEqual(overlap_summary(children)['max_concurrency'], 3)
+
+            sequential = []
+            for index, spec in enumerate(specs):
+                call_id = f'serial-{index}'
+                sequential.extend([
+                    {'type': 'tool_execution_start', 'toolCallId': call_id, 'toolName': 'Agent',
+                     'args': {**spec, 'run_in_background': False}},
+                    {'type': 'tool_execution_end', 'toolCallId': call_id, 'toolName': 'Agent',
+                     'isError': False,
+                     'result': {'details': {'agentId': identifiers[index], 'status': 'completed'}}},
+                ])
+            self.assertFalse(child_launch_evidence(
+                'tintin-subagents', sequential, 'triage', project_dir, 900)['verified'])
+
+            early_wait = json.loads(json.dumps(events))
+            early_result = [event for event in early_wait if event.get('toolCallId') == 'result-0']
+            early_wait = [event for event in early_wait if event.get('toolCallId') != 'result-0']
+            second_launch = next(index for index, event in enumerate(early_wait)
+                                 if event.get('toolCallId') == 'agent-1'
+                                 and event.get('type') == 'tool_execution_start')
+            early_wait[second_launch:second_launch] = early_result
+            self.assertFalse(child_launch_evidence(
+                'tintin-subagents', early_wait, 'triage', project_dir, 900)['verified'])
+
+            missing = [event for event in events if event.get('toolCallId') != 'result-2']
+            self.assertFalse(child_launch_evidence(
+                'tintin-subagents', missing, 'triage', project_dir, 900)['verified'])
+            foreign = json.loads(json.dumps(events))
+            next(event for event in foreign if event.get('toolCallId') == 'result-1'
+                 and event.get('type') == 'tool_execution_start')['args']['agent_id'] = 'foreign'
+            self.assertFalse(child_launch_evidence(
+                'tintin-subagents', foreign, 'triage', project_dir, 900)['verified'])
+            no_wait = json.loads(json.dumps(events))
+            next(event for event in no_wait if event.get('toolCallId') == 'result-0'
+                 and event.get('type') == 'tool_execution_start')['args']['wait'] = False
+            self.assertFalse(child_launch_evidence(
+                'tintin-subagents', no_wait, 'triage', project_dir, 900)['verified'])
+
+            duplicate = json.loads(json.dumps(events))
+            duplicate.extend({**event, 'toolCallId': 'result-extra'} for event in events
+                             if event.get('toolCallId') == 'result-0')
+            self.assertFalse(child_launch_evidence(
+                'tintin-subagents', duplicate, 'triage', project_dir, 900)['verified'])
+
+            wrong_settings = json.loads(json.dumps(events))
+            next(e for e in wrong_settings if e.get('toolName') == 'Agent'
+                 and e.get('type') == 'tool_execution_start')['args']['thinking'] = 'medium'
+            self.assertFalse(child_launch_evidence(
+                'tintin-subagents', wrong_settings, 'triage', project_dir, 900)['verified'])
+            stale_resume = json.loads(json.dumps(events))
+            next(e for e in stale_resume if e.get('toolName') == 'Agent'
+                 and e.get('type') == 'tool_execution_start')['args']['resume'] = 'old-agent'
+            self.assertFalse(child_launch_evidence(
+                'tintin-subagents', stale_resume, 'triage', project_dir, 900)['verified'])
+
+            disjoint = json.loads(json.dumps(events))
+            offset = 0
+            for event in disjoint:
+                if event.get('type') == 'entry_appended':
+                    event['entry']['data']['startedAt'] = offset * 10000 + 1000
+                    event['entry']['data']['completedAt'] = offset * 10000 + 2000
+                    offset += 1
+            disjoint_children = extract_children(disjoint, 'tintin-subagents', session_dir=session_dir)
+            self.assertFalse(overlap_summary(disjoint_children)['evidenced'])
 
     def test_fabric_comment_wrapped_code_does_not_verify_child_launch(self):
         project_dir = Path('/cell/project')
@@ -720,10 +1046,11 @@ class LauncherChecks(unittest.TestCase):
 
 class ReportingChecks(unittest.TestCase):
     def _save_cell(self, run_dir, case, arm, repetition, status='passed',
-                   termination_reason='process_exit'):
+                   termination_reason='process_exit', orchestration='scripted'):
         cell_dir = run_dir / 'cells' / f'{case}-{arm}-r{repetition:02d}'
         record = {
             'case': case, 'arm': arm, 'repetition': repetition,
+            'orchestration': orchestration, 'case_version': benchmark.CASE_VERSION,
             'status': status, 'correct': status == 'passed', 'elapsed_ms': 100,
             'answer': 'partial or final answer',
             'usage': {
@@ -810,6 +1137,21 @@ class ReportingChecks(unittest.TestCase):
         self.assertEqual(triage['paired_speedup']['subagents']['median_speedup'], 2)
         self.assertEqual(len(result['failed_cells']), 1)
 
+    def test_report_never_pools_or_pairs_different_experiments(self):
+        base = {'case': 'control', 'arm': 'stock', 'repetition': 1,
+                'status': 'passed', 'correct': True, 'elapsed_ms': 1000,
+                'usage': {'known': False}}
+        legacy = build_report([base], 1, cases=['control'], arms=['stock'])
+        self.assertEqual((legacy['orchestration'], legacy['case_version']), ('legacy', 1))
+        scripted = {**base, 'orchestration': 'scripted', 'case_version': 2}
+        current = build_report([scripted], 1, cases=['control'], arms=['stock'])
+        self.assertEqual((current['orchestration'], current['case_version']), ('scripted', 2))
+        with self.assertRaises(ValueError):
+            build_report([base, scripted], 1, cases=['control'], arms=['stock'])
+        with self.assertRaises(ValueError):
+            build_report([scripted, {**scripted, 'orchestration': 'model-directed'}],
+                         1, cases=['control'], arms=['stock'])
+
     def test_markdown_report_preserves_metrics_and_unknowns(self):
         def cell(arm, repetition, status, elapsed, usage, overlap=None, failures=None):
             return {
@@ -891,6 +1233,9 @@ class ReportingChecks(unittest.TestCase):
             manifest = json.loads((Path(report['run_dir']) / 'run.json').read_text())
             self.assertEqual(manifest['repetitions'], 1)
             self.assertEqual(manifest['repetition_ids'], [3])
+            self.assertEqual(manifest['orchestration'], 'scripted')
+            self.assertEqual(report['orchestration'], 'scripted')
+            self.assertEqual(report['case_version'], benchmark.CASE_VERSION)
             markdown_path = Path(report['markdown_report'])
             self.assertEqual(markdown_path, Path(report['run_dir']) / 'report.md')
             self.assertIn('100.0 ms', markdown_path.read_text())
@@ -906,6 +1251,111 @@ class ReportingChecks(unittest.TestCase):
             self.assertTrue(markdown_path.exists())
             self.assertEqual(regenerated['markdown_report'], str(markdown_path))
             self.assertIn('100.0 ms', markdown_path.read_text())
+
+    def test_stress_run_rejects_stock_and_model_directed_before_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for arm, mode in (('stock', 'scripted'), ('fabric', 'model-directed')):
+                with self.subTest(arm=arm, mode=mode), \
+                     patch('benchmark.preflight', side_effect=AssertionError('unexpected preflight')) as check, \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    status = main(['--cache-root', tmp, 'run', '--case',
+                                   'integration-contention', '--arm', arm,
+                                   '--orchestration', mode])
+                self.assertEqual(status, 2)
+                check.assert_not_called()
+
+    def test_run_preflight_checks_only_its_selected_extension(self):
+        for arm, mode, expected in (('stock', 'scripted', ()),
+                                    ('fabric', 'scripted', ('fabric',)),
+                                    ('tintin-subagents', 'model-directed', ('tintin-subagents',))):
+            with self.subTest(arm=arm, mode=mode), tempfile.TemporaryDirectory() as tmp, \
+                 patch('benchmark.preflight', return_value={
+                     'passed': False, 'errors': ['blocked'], 'package_info': {},
+                 }) as check, contextlib.redirect_stdout(io.StringIO()):
+                status = main(['--cache-root', tmp, 'run', '--case', 'control',
+                               '--arm', arm, '--orchestration', mode])
+                self.assertEqual(status, 1)
+                check.assert_called_once_with(Path(tmp).resolve(), arms=expected,
+                                              scripted=mode == 'scripted')
+
+    def test_blocked_scripted_capability_is_not_an_execution_failure(self):
+        check = {'passed': False, 'global_passed': True, 'errors': ['no callable path'],
+                 'package_info': {}, 'scripted_capabilities': {
+                     'fabric': {'verified': False, 'reason': 'no callable path'},
+                 }}
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch('benchmark.preflight', return_value=check), \
+             patch('benchmark._attempt_cell') as attempt, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            status = main(['--cache-root', tmp, 'run', '--case', 'control',
+                           '--arm', 'fabric', '--orchestration', 'scripted'])
+            report = json.loads(output.getvalue())
+            markdown = Path(report['markdown_report']).read_text()
+            rebuilt_output = io.StringIO()
+            with contextlib.redirect_stdout(rebuilt_output):
+                rebuilt_status = main(['--cache-root', tmp, 'report', report['run_dir']])
+            rebuilt = json.loads(rebuilt_output.getvalue())
+            saved = json.loads((Path(report['run_dir']) / 'report.json').read_text())
+            rebuilt_markdown = Path(report['markdown_report']).read_text()
+        self.assertEqual(status, 1)
+        self.assertEqual(rebuilt_status, 0)
+        self.assertEqual(rebuilt['capability_coverage'], report['capability_coverage'])
+        self.assertEqual(saved['capability_coverage'], report['capability_coverage'])
+        self.assertIn('no callable path', rebuilt_markdown)
+        attempt.assert_not_called()
+        self.assertEqual(report['state'], 'blocked_capability')
+        self.assertEqual(report['capability_coverage']['blocked'], {'fabric': 'no callable path'})
+        self.assertEqual(report['failed_cells'], [])
+        self.assertEqual(report['recorded_cells'], 0)
+        self.assertEqual(len(report['missing_cells']), 1)
+        self.assertIn('no callable path', markdown)
+
+    def test_model_directed_run_has_its_own_manifest_and_report_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def attempt(run_dir, case, arm, repetition, *_):
+                return self._save_cell(run_dir, case, arm, repetition,
+                                       orchestration='model-directed')
+
+            output = io.StringIO()
+            with patch('benchmark.preflight', return_value={
+                    'passed': True, 'package_info': {}}), \
+                    patch('benchmark._attempt_cell', side_effect=attempt), \
+                    contextlib.redirect_stdout(output):
+                status = main(['--cache-root', tmp, 'run', '--case', 'triage',
+                               '--arm', 'stock', '--orchestration', 'model-directed'])
+            result = json.loads(output.getvalue())
+            self.assertEqual(status, 0)
+            self.assertEqual(result['record']['orchestration'], 'model-directed')
+            self.assertEqual(result['report']['orchestration'], 'model-directed')
+            run = Path(result['report']['run_dir'])
+            self.assertEqual(json.loads((run / 'run.json').read_text())['orchestration'],
+                             'model-directed')
+
+    def test_legacy_report_rebuild_does_not_rewrite_saved_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp) / 'runs' / 'old'
+            cell_dir = run / 'cells' / 'control-stock-r01'
+            cell_dir.mkdir(parents=True)
+            (run / 'run.json').write_text(json.dumps({
+                'run_id': 'old', 'mode': 'single', 'state': 'complete',
+                'cases': ['control'], 'arms': ['stock'], 'repetitions': 1,
+            }))
+            (cell_dir / 'cell.json').write_text(json.dumps({
+                'case': 'control', 'arm': 'stock', 'repetition': 1,
+                'status': 'passed', 'correct': True, 'elapsed_ms': 100,
+                'usage': {'known': False},
+            }))
+            (run / 'report.md').write_text('original markdown')
+            (run / 'report.json').write_text('original json')
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = main(['--cache-root', tmp, 'report', str(run)])
+            report = json.loads(output.getvalue())
+            self.assertEqual(status, 0)
+            self.assertEqual((report['orchestration'], report['case_version']), ('legacy', 1))
+            self.assertIsNone(report.get('markdown_report'))
+            self.assertEqual((run / 'report.md').read_text(), 'original markdown')
+            self.assertEqual((run / 'report.json').read_text(), 'original json')
 
     def test_write_json_replaces_symlink_without_modifying_target(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -965,7 +1415,8 @@ class ReportingChecks(unittest.TestCase):
     def test_runner_error_is_saved_and_recorded_as_an_attempt(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
-            manifest = {'completed_cells': []}
+            manifest = {'completed_cells': [], 'orchestration': 'scripted',
+                        'case_version': benchmark.CASE_VERSION}
             with patch('benchmark.run_cell', side_effect=RuntimeError('runner exploded')):
                 records = _run_cells(
                     run_dir, manifest, {'package_info': {}},
@@ -982,7 +1433,32 @@ class ReportingChecks(unittest.TestCase):
             self.assertIn('runner exploded', saved['failures'][0])
             self.assertEqual(run_manifest['completed_cells'][0]['status'], 'failed')
 
-    def test_matrix_stops_at_failed_smoke_gate_with_full_missing_count(self):
+    def test_scripted_matrix_stops_at_failed_case_gate_with_full_missing_count(self):
+        for failure_at in (2, 5):
+            with self.subTest(failure_at=failure_at), tempfile.TemporaryDirectory() as tmp:
+                attempts = []
+                output = io.StringIO()
+
+                def attempt(run_dir, case, arm, repetition, *_):
+                    attempts.append((case, arm, repetition))
+                    status = 'failed' if len(attempts) == failure_at else 'passed'
+                    return self._save_cell(run_dir, case, arm, repetition, status)
+
+                with patch('benchmark.preflight', return_value={
+                        'passed': True, 'package_info': {}}), \
+                        patch('benchmark._attempt_cell', side_effect=attempt), \
+                        contextlib.redirect_stdout(output):
+                    status = main(['--cache-root', tmp, 'matrix', '--repetitions', '3'])
+
+                report = json.loads(output.getvalue())
+                manifest = json.loads((Path(report['run_dir']) / 'run.json').read_text())
+                self.assertEqual(status, 1)
+                self.assertEqual(len(attempts), failure_at)
+                self.assertEqual(manifest['state'], 'gate_failed')
+                self.assertEqual(report['planned_cells'], 60)
+                self.assertEqual(len(report['missing_cells']), 60 - failure_at)
+
+    def test_model_directed_matrix_records_ordering_failures_without_stopping(self):
         with tempfile.TemporaryDirectory() as tmp:
             attempts = []
             output = io.StringIO()
@@ -990,21 +1466,86 @@ class ReportingChecks(unittest.TestCase):
             def attempt(run_dir, case, arm, repetition, *_):
                 attempts.append((case, arm, repetition))
                 status = 'failed' if len(attempts) == 2 else 'passed'
-                return self._save_cell(run_dir, case, arm, repetition, status)
+                return self._save_cell(run_dir, case, arm, repetition, status,
+                                       orchestration='model-directed')
+
+            with patch('benchmark.preflight', return_value={
+                    'passed': True, 'package_info': {}}), \
+                    patch('benchmark._attempt_cell', side_effect=attempt), \
+                    contextlib.redirect_stdout(output):
+                status = main(['--cache-root', tmp, 'matrix', '--repetitions', '3',
+                               '--orchestration', 'model-directed'])
+            report = json.loads(output.getvalue())
+            self.assertEqual(status, 1)
+            self.assertEqual(report['state'], 'complete')
+            self.assertEqual(report['orchestration'], 'model-directed')
+            self.assertEqual(report['recorded_cells'], 60)
+            self.assertEqual(len(report['failed_cells']), 1)
+            self.assertEqual(report['missing_cells'], [])
+
+    def test_scripted_matrix_uses_the_first_repetition_as_its_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            attempts = []
+            output = io.StringIO()
+
+            def attempt(run_dir, case, arm, repetition, *_):
+                attempts.append((case, arm, repetition))
+                return self._save_cell(run_dir, case, arm, repetition)
 
             with patch('benchmark.preflight', return_value={
                     'passed': True, 'package_info': {}}), \
                     patch('benchmark._attempt_cell', side_effect=attempt), \
                     contextlib.redirect_stdout(output):
                 status = main(['--cache-root', tmp, 'matrix', '--repetitions', '3'])
+            report = json.loads(output.getvalue())
+            self.assertEqual(status, 0)
+            self.assertEqual(report['state'], 'complete')
+            self.assertEqual((report['planned_cells'], report['recorded_cells'],
+                              report['passed_cells']), (60, 60, 60))
+            self.assertEqual(len(attempts), len(set(attempts)))
+            self.assertEqual({(case, arm) for case, arm, repetition in attempts[:20]
+                              if repetition == 1},
+                             {(case, arm) for case in benchmark.CASES for arm in ARMS})
 
+    def test_selected_scripted_matrix_keeps_fabric_block_visible(self):
+        selected = ('stock', 'subagents', 'tintin-subagents')
+        with tempfile.TemporaryDirectory() as tmp:
+            attempts = []
+            output = io.StringIO()
+
+            def attempt(run_dir, case, arm, repetition, *_):
+                attempts.append((case, arm, repetition))
+                return self._save_cell(run_dir, case, arm, repetition)
+
+            check_result = {'passed': True, 'package_info': {}, 'scripted_capabilities': {
+                'subagents': {'verified': True}, 'tintin-subagents': {'verified': True},
+            }}
+            with patch('benchmark.preflight', return_value=check_result) as check, \
+                 patch('benchmark._attempt_cell', side_effect=attempt), \
+                 contextlib.redirect_stdout(output):
+                status = main(['--cache-root', tmp, 'matrix', '--repetitions', '3',
+                               '--arms', *selected])
             report = json.loads(output.getvalue())
             manifest = json.loads((Path(report['run_dir']) / 'run.json').read_text())
-            self.assertEqual(status, 1)
-            self.assertEqual(len(attempts), 4)
-            self.assertEqual(manifest['state'], 'smoke_failed')
-            self.assertEqual(report['planned_cells'], 60)
-            self.assertEqual(len(report['missing_cells']), 56)
+            self.assertEqual(status, 0)
+            check.assert_called_once_with(Path(tmp).resolve(),
+                                          arms=selected[1:], scripted=True)
+            self.assertEqual(manifest['arms'], list(selected))
+            self.assertEqual((report['planned_cells'], report['recorded_cells'],
+                              report['passed_cells']), (45, 45, 45))
+            self.assertEqual({(case, arm) for case, arm, repetition in attempts[:15]
+                              if repetition == 1},
+                             {(case, arm) for case in benchmark.CASES for arm in selected})
+            self.assertEqual(attempts[15][2], 2)
+            self.assertNotIn('fabric', report['cases']['triage']['arms'])
+            self.assertIn('fabric', report['capability_coverage']['blocked'])
+            self.assertIn('not selected', report['capability_coverage']['blocked']['fabric'])
+            self.assertEqual(report['missing_cells'], [])
+            rebuilt = io.StringIO()
+            with contextlib.redirect_stdout(rebuilt):
+                self.assertEqual(main(['--cache-root', tmp, 'report', report['run_dir']]), 0)
+            self.assertEqual(json.loads(rebuilt.getvalue())['capability_coverage'],
+                             report['capability_coverage'])
 
     def test_matrix_interrupt_saves_cell_and_report_without_later_attempts(self):
         with tempfile.TemporaryDirectory() as tmp:

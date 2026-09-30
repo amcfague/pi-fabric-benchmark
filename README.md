@@ -4,7 +4,7 @@ Compare stock Pi with `pi-subagents`, `@tintinweb/pi-subagents`, and `pi-fabric`
 
 ## Workloads and workflows
 
-The fixture has three Python modules: `catalog.py`, `billing.py`, and `shipping.py`. Each arm runs every case on a fresh project copy. The task stays the same; only the delegation instructions change.
+The fixture has three Python modules: `catalog.py`, `billing.py`, and `shipping.py`. Each arm gets a fresh project copy and the same task facts. The benchmark controls child launch order in the default scripted mode; `--orchestration model-directed` separately measures which calls a parent model chooses.
 
 ### Workloads
 
@@ -14,7 +14,8 @@ The fixture has three Python modules: `catalog.py`, `billing.py`, and `shipping.
 | patch | Fix one balanced defect per module and pass an integrated behavior check. |
 | control | Handle one read-only billing task; measure the cost of delegating a single task. |
 | debug | Use three failing contract tests to find and fix root causes. |
-| integration | Reconcile uneven child edits to the same file and verify the combined change. |
+| integration | Fix three modules with one shipping child owning both shipping functions; verify the combined change. |
+| integration-contention | Opt-in stress case: two children edit different functions in `shipping.py`; require edit evidence and final correctness. |
 
 ### Workflows
 
@@ -22,10 +23,10 @@ The fixture has three Python modules: `catalog.py`, `billing.py`, and `shipping.
 |---|---|
 | `stock` | Pi core tools without extensions, as a baseline. Normal concurrent core-tool calls remain allowed. |
 | `subagents` | A foreground `pi-subagents` workflow that launches child sessions. |
-| `tintin-subagents` | Batched foreground `Agent` calls from `@tintinweb/pi-subagents`. |
+| `tintin-subagents` | Launches background `Agent` children, then collects them with `get_subagent_result`. |
 | `fabric` | A `fabric_exec` script that launches parallel child runs. |
 
-Plugin arms use one child for control, three for triage/patch/debug, and four for integration.
+Plugin arms use one child for control, three for triage/patch/debug/main integration, and four only for the separate contention case. Stock works directly with its core tools in both comparisons.
 
 ## Setup
 
@@ -38,11 +39,14 @@ Requires Python 3, npm, and `/usr/local/bin/pi`. The Pi wrapper handles model au
 
 ```sh
 python3 benchmark.py install      # one-time download; npm lifecycle scripts are disabled
-python3 benchmark.py preflight    # checks the Pi wrapper, npm integrity, lockfiles and package hashes
+python3 benchmark.py preflight --arm subagents --arm tintin-subagents  # required offline native proof
+python3 benchmark.py preflight    # all pinned arms; currently reports Fabric blocked
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
 ```
 
-`preflight` does not install packages or start agents. It checks the Pi wrapper, the registry's pinned tarball integrity, and the installed package tree against the saved manifest. Authentication is delegated to the Pi wrapper and is exercised by the first live cell, with no separate billable probe.
+`preflight` does not install packages or call a paid model. It checks the Pi wrapper, package pins and tree hashes, then dispatches one local-provider child through each selected supported extension. The native join must show the child ID, settings, session, output and synthetic usage; probe tokens are not included in benchmark cells. A single-arm run checks only its package. Authentication stays with the Pi wrapper and is exercised by the first live cell.
+
+The pinned `pi-fabric@0.100.0` cannot pass this offline proof: the synthetic child settles but misses Fabric's five-second exit grace. Earlier paid main cases passed; this block does not claim paid Fabric work is impossible. The full four-arm scripted matrix stops before paid cells. Stock, `subagents` and `tintin-subagents` remain available as single-arm runs; a model-directed run is not a substitute for a blocked scripted arm.
 
 On macOS, the default cache is `~/Library/Caches/pi-parallel-benchmark`; elsewhere it follows `XDG_CACHE_HOME` or `~/.cache`. Override it by placing `--cache-root /path` before the subcommand.
 
@@ -51,25 +55,27 @@ On macOS, the default cache is `~/Library/Caches/pi-parallel-benchmark`; elsewhe
 ```sh
 python3 benchmark.py smoke
 python3 benchmark.py run --case triage --arm stock
-python3 benchmark.py matrix --repetitions 3 --deadline 900
+python3 benchmark.py run --case triage --arm tintin-subagents --orchestration model-directed
+python3 benchmark.py run --case integration-contention --arm tintin-subagents
+python3 benchmark.py matrix --arms stock subagents tintin-subagents --repetitions 3 --deadline 900
 ```
 
-`smoke` runs the four triage arms once. A matrix uses its first four cells as a smoke gate: triage repetition 1 runs in stock, subagents, tintin-subagents, fabric order. If any fail, it saves the report and stops. Otherwise it runs the remaining cells, rotating arm order across cases and repetitions. The default five cases and three repetitions produce 60 planned cells; matrix repetitions must be at least three. Running `smoke` separately before a matrix costs four additional trials.
+`run`, `smoke`, and `matrix` default to scripted execution. `smoke` attempts the four triage arms once and currently blocks on Fabric. A scripted matrix uses its first repetition across all five main cases and selected arms as a gate; it stops on the first failed cell before paying for later repetitions. A model-directed matrix records ordering failures and continues. The selected three-arm matrix plans 45 cells and lists Fabric as excluded and capability-blocked, never as a failed trial. The default four-arm matrix plans 60 cells but currently stops before paid cells. A separate smoke run costs four additional trials when its arms pass preflight.
 
-Each cell uses provider `openai`, model `gpt-6-sol`, thinking `xhigh`, and a 900-second process deadline by default. Stock receives the core tools `read,grep,find,ls,bash,edit,write`; plugin children receive that set with the same project and deadline. Subagents inherit the parent provider/model; private cell settings match the worker's effective thinking level to the parent's `xhigh`. The subagents parent allowlists `subagents_enable` and `subagent`; the Fabric parent allowlists `fabric_exec`. `--deadline` changes the per-cell deadline in seconds.
+Each cell targets `openai/gpt-6-sol` at `xhigh` with a 900-second deadline. Stock and plugin children get `read,grep,find,ls,bash,edit,write`. Scripted plugin cells load their pinned extension plus the local `scripted-provider.ts` driver. The driver emits fixed tool calls through Pi's normal RPC tool path without a model choosing their order: one foreground `runs.all` workflow, all Tintin background launches before result collection, or one Fabric `Promise.all` program. A separate tool-free Pi session on the target model synthesizes the child results. The measured time includes dispatch, children, and synthesis; fixture setup and external grading stay outside it. Model-directed mode keeps the original parent-selected tool calls as a separate measurement.
 
-Every parent launches through `/usr/local/bin/pi`. Each cell gets a fresh private `PI_CODING_AGENT_DIR` and a filtered environment; the Pi wrapper is first on `PATH` and is set as both `PI_SUBAGENT_PI_BINARY` and `PI_FABRIC_PI_BINARY`. All parents disable skills, prompt templates, themes, context files, and approvals. Stock also passes `--no-extensions`; each plugin parent loads its pinned package with `-e` from the private cache, while the fixture stays extension-free. The subagents installer pins the wrapper-matched `@earendil-works/pi-coding-agent@0.87.1` host runtime and sets `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT` so foreground child sessions use the parent provider registry. `pi-subagents` children request `extensions: []` and `skills: []`; Tintin children use foreground `Agent` calls with `isolated: true` and fresh context, and cell-local `subagents.json` enables its otherwise-off usage reporting; Fabric children request `extensions: false`. The subagents arm runs one foreground workflow with foreground children and no per-run model override; it reads each child answer and actual start/final-response timestamps from a returned `sessionFile` confined to that cell's session directory, and usage from successful child result records. For Fabric, it verifies the exact parallel `fabric_exec` script and reads child telemetry only from that successful tool result. All plugin arms require known token usage. Timestamped child overlap is required for multi-child cases; the one-child control is exempt. Direct use of `pi.real` is rejected unless both lowercase proxy variables are present. Provider-side prompt-cache state is not controlled or isolated per cell: cache-read/write usage is reported when available, and later cells may observe a warm cache even though sessions and project copies are fresh.
+Every Pi process uses `/usr/local/bin/pi`, a private `PI_CODING_AGENT_DIR`, and a filtered environment. The wrapper is first on `PATH` and supplies both child binary routes. Skills, prompt templates, themes, context files, and approvals are disabled. `pi-subagents` uses its pinned host runtime; scripted cells pin the worker model and thinking in private settings because the zero-token dispatch provider is not the child model. Tintin children receive explicit model/thinking settings and report pooled usage; Fabric returns package-owned child timestamps and usage. Child extension/skill isolation remains in force. Multi-child cells require native overlap and known usage; the one-child control does not require overlap. Provider-side prompt-cache state is not isolated across cells, so later cells may see a warm cache.
 
 ## Reports and artifacts
 
-Each run prints JSON with its run ID, run directory, and `markdown_report` path. Runs are stored under `<cache-root>/runs/<timestamp>-<id>/` with `run.json`, `preflight.json`, `report.json`, and `report.md`. Rebuild both reports with:
+Each run prints JSON with its run ID, run directory, and `markdown_report` path. Runs are stored under `<cache-root>/runs/<timestamp>-<id>/` with `run.json`, `preflight.json`, `report.json`, and `report.md`. Rebuild new reports with:
 
 ```sh
 python3 benchmark.py report /path/to/run-directory
 ```
 
-Every attempted cell writes `cell.json`. A launched cell also retains `events.jsonl`, `stderr.log`, `argv.json`, `prompt.txt`, the Pi session, a writable project copy, and the private agent directory. The full `cell.json` includes the answer, grader result, fixture hash, selected package version/integrity/tree hash, child launch evidence and records, usage, elapsed time, termination reason, and failures. Cache and run directories are created with owner-only permissions. Treat artifacts as private: they contain agent transcripts and project copies.
+Every attempted cell writes `cell.json` plus raw events, stderr, arguments, prompt, session, project copy, and private agent directory. Scripted cells also retain their fixed call plan, driver events, and separate synthesis events. Debug cells retain initial failing-test output. The cell records child evidence, model settings, usage, diagnostics, elapsed time, grading, and failures. Cache and run directories are owner-only; treat transcripts and project copies as private.
 
-`report.md` summarizes each case and arm with passed/planned counts, failures, not-run cells, pass rate, median elapsed time, paired speedup and sample size, input/output/cache-token totals, total parent-plus-child turns, cost completeness, and child-overlap evidence. It also lists attempted and missing cells. Medians use passed cells only; paired speedups compare stock and an arm only where both passed in the same repetition. Incomplete usage or overlap evidence is labeled unknown, never zero. `report.json` retains the structured data. A cell that fails grading, settling, usage, package/loadout verification, or required child-overlap evidence is not a successful trial. Ctrl-C during Pi execution terminates the process group, saves the interrupted cell and both reports, and stops the remaining schedule.
+Reports keep scripted, model-directed, stress, and historical case versions separate. Rebuilding a historical mode-less report prints a newly labeled summary without rewriting its saved files. `report.md` lists attempted and missing cells, capability blocks, pass rates, passing-only median times, paired sample counts, tokens/cache, turns, cost completeness, and native overlap. Stress has no paired stock speedup and needs native evidence of both same-file edit attempts; missing evidence stays unknown. Failed children, deadlines, missing usage, and unrecognized non-JSON events remain failures. Exact known relay diagnostics are counted rather than rejected. No failed cell is retried automatically.
 
-The live matrix may use substantial model budget: up to 60 parent trials plus four children for each plugin trial (the integration case; other plugin cases use one or three). No failed cell is retried automatically.
+The selected matrix may spend on 45 parent trials and up to three children per plugin trial. A four-arm default matrix would spend on 60 after Fabric passes preflight. The separate same-file stress case uses four children per plugin arm.
